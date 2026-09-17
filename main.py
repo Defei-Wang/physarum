@@ -3,87 +3,88 @@ import math
 import time
 
 ti.init(arch=ti.vulkan)
-W, H = 800, 800; MAX_NODES = 35000; N_ATTRS = 12000
+N_AGENTS = 512 * 512; RES = 800
+field_R = ti.field(dtype=ti.f32, shape=(RES, RES))
+field_G = ti.field(dtype=ti.f32, shape=(RES, RES))
+field_G_new = ti.field(dtype=ti.f32, shape=(RES, RES))
+pixels = ti.Vector.field(3, dtype=ti.f32, shape=(RES, RES))
+pos = ti.Vector.field(2, dtype=ti.f32, shape=N_AGENTS)
+angle = ti.field(dtype=ti.f32, shape=N_AGENTS)
 
-attr_pos = ti.Vector.field(2, dtype=ti.f32, shape=N_ATTRS)
-attr_active = ti.field(dtype=ti.i32, shape=N_ATTRS)
-node_pos = ti.Vector.field(2, dtype=ti.f32, shape=MAX_NODES)
-node_parent = ti.field(dtype=ti.i32, shape=MAX_NODES)
-node_depth = ti.field(dtype=ti.i32, shape=MAX_NODES)
-node_dir = ti.Vector.field(2, dtype=ti.f32, shape=MAX_NODES)
-node_pull_count = ti.field(dtype=ti.i32, shape=MAX_NODES)
-node_count = ti.field(dtype=ti.i32, shape=())
-trail = ti.field(dtype=ti.f32, shape=(W, H))
-trail_blur = ti.field(dtype=ti.f32, shape=(W, H))
-pixels = ti.Vector.field(3, dtype=ti.f32, shape=(W, H))
+DECAY = 0.90; SA_RAW = 2.0; RA_RAW = 4.0; SO_RAW = 12.0; SS_RAW = 1.1
+RAD = 1.0 / math.pi; SA = SA_RAW * RAD; RA = RA_RAW * RAD
 
 @ti.func
-def fract(x): return x - ti.floor(x)
+def fract_val(x: ti.f32) -> ti.f32: return x - ti.floor(x)
 @ti.func
-def lerp_vec(a, b, t): return a * (1.0 - t) + b * t
+def fract_vec(v): return ti.Vector([fract_val(v.x), fract_val(v.y)])
 @ti.func
-def smoothstep_val(edge0: ti.f32, edge1: ti.f32, x: ti.f32) -> ti.f32:
-    t = ti.min(ti.max((x - edge0) / (edge1 - edge0), 0.0), 1.0)
-    return t * t * (3.0 - 2.0 * t)
+def hash_rand(coord, time_val: ti.f32):
+    SQ2 = 1.41421356237 * 1000.0; PHI = 1.61803398875 * 0.1
+    c2 = coord * (time_val + PHI); dist = ti.sqrt((c2.x - PHI) ** 2 + (c2.y - math.pi * 0.1) ** 2)
+    return fract_val(ti.tan(dist) * SQ2)
 
 @ti.kernel
-def init_topology():
-    node_count[None] = 1; node_pos[0] = ti.Vector([W * 0.5, H * 0.5]); node_parent[0] = -1; node_depth[0] = 0
-    for i in range(N_ATTRS):
-        th = ti.random(ti.f32) * 6.2831853; r = ti.sqrt(ti.random(ti.f32)) * (W * 0.45)
-        attr_pos[i] = ti.Vector([W * 0.5 + ti.cos(th) * r, H * 0.5 + ti.sin(th) * r]); attr_active[i] = 1
+def init_simulation():
+    for i in range(N_AGENTS): pos[i] = ti.Vector([ti.random(ti.f32), ti.random(ti.f32)]); angle[i] = ti.random(ti.f32) * math.pi * 2.0
+
+@ti.func
+def get_trail_value(uv) -> ti.f32:
+    wrapped_uv = fract_vec(uv); ix = int(wrapped_uv.x * RES); iy = int(wrapped_uv.y * RES)
+    return field_G[ix, iy]
 
 @ti.kernel
-def sca_grow_step(kill_dist: ti.f32, attract_dist: ti.f32, step_size: ti.f32):
-    nc = node_count[None]
-    for i in range(nc): node_dir[i] = ti.Vector([0.0, 0.0]); node_pull_count[i] = 0
-    for i in range(N_ATTRS):
-        if attr_active[i] == 1:
-            ap = attr_pos[i]; min_d, min_idx = 999999.0, -1
-            for j in range(node_count[None]):
-                d = (ap - node_pos[j]).norm()
-                if d < min_d: min_d = d; min_idx = j
-            if min_d < kill_dist: attr_active[i] = 0
-            elif min_d < attract_dist:
-                vec = (ap - node_pos[min_idx]) / min_d
-                ti.atomic_add(node_dir[min_idx][0], vec[0]); ti.atomic_add(node_dir[min_idx][1], vec[1])
-                ti.atomic_add(node_pull_count[min_idx], 1)
-    for i in range(nc):
-        if node_pull_count[i] > 0:
-            idx = ti.atomic_add(node_count[None], 1)
-            if idx < MAX_NODES:
-                ndir = node_dir[i].normalized()
-                ang = ti.atan2(ndir.y, ndir.x) + (ti.random(ti.f32) - 0.5) * 0.2
-                ndir = ti.Vector([ti.cos(ang), ti.sin(ang)])
-                new_pos = node_pos[i] + ndir * step_size
-                node_pos[idx] = new_pos; node_parent[idx] = i; node_depth[idx] = node_depth[i] + 1
-                dist = step_size; steps = int(ti.ceil(dist * 1.5))
-                thickness = ti.max(0.1, 4.0 - float(node_depth[idx]) * 0.06)
-                for step in range(steps):
-                    t = float(step) / float(steps); p = node_pos[i] * (1.0 - t) + new_pos * t
-                    ix, iy = int(p.x), int(p.y)
-                    if 0 <= ix < W and 0 <= iy < H: trail[ix, iy] += thickness * 0.8
+def update_agents_and_deposit(time_val: ti.f32):
+    for i, j in field_R: field_R[i, j] = 0.0
+    for i in range(N_AGENTS):
+        p = pos[i]; ang = angle[i]
+        so_vec = SO_RAW / RES; ss_vec = SS_RAW / RES
+        uvFL = p + ti.Vector([ti.cos(ang - SA), ti.sin(ang - SA)]) * so_vec
+        uvF  = p + ti.Vector([ti.cos(ang), ti.sin(ang)]) * so_vec
+        uvFR = p + ti.Vector([ti.cos(ang + SA), ti.sin(ang + SA)]) * so_vec
+        FL = get_trail_value(uvFL); F  = get_trail_value(uvF); FR = get_trail_value(uvFR)
+        if F > FL and F > FR: pass
+        elif F < FL and F < FR:
+            if hash_rand(p, time_val) > 0.5: ang += RA
+            else: ang -= RA
+        elif FL < FR: ang += RA
+        elif FL > FR: ang -= RA
+        p += ti.Vector([ti.cos(ang), ti.sin(ang)]) * ss_vec; p = fract_vec(p)
+        pos[i] = p; angle[i] = ang
+        ix = int(p.x * RES); iy = int(p.y * RES)
+        if 0 <= ix < RES and 0 <= iy < RES: field_R[ix, iy] += 1.0
 
 @ti.kernel
-def smooth_graph_lines():
-    for i, j in trail:
-        s = 0.0
+def diffuse_and_decay():
+    weight = 1.0 / 9.0
+    for i, j in field_G:
+        col = 0.0
         for dx, dy in ti.static([(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 0), (0, 1), (1, -1), (1, 0), (1, 1)]):
-            s += trail[ti.min(ti.max(i + dx, 0), W - 1), ti.min(ti.max(j + dy, 0), H - 1)]
-        trail_blur[i, j] = s / 9.0
+            ni = (i + dx + RES) % RES; nj = (j + dy + RES) % RES
+            val_r = field_R[ni, nj]; val_g = field_G[ni, nj]
+            col += val_r * weight + val_g * weight * 0.5
+        field_G_new[i, j] = col * DECAY
+    for i, j in field_G: field_G[i, j] = field_G_new[i, j]
 
 @ti.kernel
-def apply_botanical_shader():
-    for i, j in pixels:
-        val = ti.min(trail_blur[i, j] * 0.8, 1.0)
-        dist = ti.min(ti.max((ti.Vector([float(i)/W, float(j)/H]) - ti.Vector([0.5, 0.5])).norm() * 2.0, 0.0), 1.0)
-        val = ti.pow(val, 0.5 + dist * 0.4)
-        col = lerp_vec(ti.Vector([0.96, 0.94, 0.90]), lerp_vec(ti.Vector([0.12, 0.08, 0.06]), ti.Vector([0.55, 0.48, 0.40]), dist), val)
-        col += ti.Vector([-0.02, -0.01, 0.03]) * (smoothstep_val(0.15, 0.4, val) * smoothstep_val(0.7, 0.4, val))
-        pixels[i, j] = ti.max(0.0, ti.min(1.0, col))
+def interact_mouse(mx: ti.f32, my: ti.f32):
+    count = 1200; radius = 0.03; u, v = mx, my
+    for i in range(count):
+        idx = int(ti.random(ti.f32) * N_AGENTS); a = ti.random(ti.f32) * math.pi * 2.0; r = ti.random(ti.f32) * radius
+        pos[idx] = fract_vec(ti.Vector([u + ti.cos(a) * r, v + ti.sin(a) * r]))
 
-init_topology()
-gui = ti.GUI("Scheme B: Pure Topological Vascular Graph", res=(W, H))
+@ti.kernel
+def render_postprocess():
+    for i, j in pixels:
+        val = field_G[i, j]; val = ti.min(ti.max(val, 0.0), 1.0)
+        pixels[i, j] = ti.Vector([val, val, val])
+
+init_simulation()
+gui = ti.GUI("1:1 nicoptere/physarum Translation", res=(RES, RES))
+start_t = time.time()
 while gui.running:
-    if node_count[None] < MAX_NODES - 100: sca_grow_step(kill_dist=6.0, attract_dist=50.0, step_size=3.5)
-    smooth_graph_lines(); apply_botanical_shader(); gui.set_image(pixels); gui.show()
+    if gui.is_pressed(ti.GUI.LMB):
+        mx, my = gui.get_cursor_pos(); interact_mouse(mx, my)
+    cur_time = float(time.time() - start_t)
+    update_agents_and_deposit(cur_time); diffuse_and_decay(); render_postprocess()
+    gui.set_image(pixels); gui.show()
