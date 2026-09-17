@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Physarum v2.0 - Generational Tip-Growth</title>
+  <style>
+    body { margin: 0; background: #000; overflow: hidden; display: flex; justify-content: center; align-items: center; height: 100vh; }
+    canvas { width: 100vmin; height: 100vmin; display: block; }
+    .hud { position: absolute; top: 12px; left: 12px; color: #444; font-family: monospace; font-size: 12px; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <div class="hud">v2.0: Generational Tip-Growth (FBM Substrate & Paper Grain)<br>Left Click: Inoculate child bud</div>
+  <canvas id="c"></canvas>
+
+  <script>
+    const canvas = document.getElementById("c");
+    const gl = canvas.getContext("webgl");
+    const RES = 800;
+    const MAX_AGENTS = 30000;
+    canvas.width = RES; canvas.height = RES;
+    gl.getExtension("OES_texture_float");
+
+    function createShader(gl, type, src) {
+      const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s;
+    }
+    function createProgram(gl, vs, fs) {
+      const p = gl.createProgram();
+      gl.attachShader(p, createShader(gl, gl.VERTEX_SHADER, vs));
+      gl.attachShader(p, createShader(gl, gl.FRAGMENT_SHADER, fs));
+      gl.linkProgram(p); return p;
+    }
+
+    const baseVS = `attribute vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
+
+    // 1. 轨迹平滑与衰减 (挥发率 0.985)
+    const decayFS = `
+      precision highp float;
+      uniform sampler2D u_trail;
+      uniform vec2 u_res;
+      void main() {
+        vec2 uv = gl_FragCoord.xy / u_res;
+        vec2 d = 1.0 / u_res;
+        float s = (
+          texture2D(u_trail, uv + vec2(-d.x, -d.y)).r + texture2D(u_trail, uv + vec2(0.0, -d.y)).r + texture2D(u_trail, uv + vec2(d.x, -d.y)).r +
+          texture2D(u_trail, uv + vec2(-d.x, 0.0)).r  + texture2D(u_trail, uv).r                   + texture2D(u_trail, uv + vec2(d.x, 0.0)).r +
+          texture2D(u_trail, uv + vec2(-d.x, d.y)).r  + texture2D(u_trail, uv + vec2(0.0, d.y)).r  + texture2D(u_trail, uv + vec2(d.x, d.y)).r
+        ) / 9.0;
+        float val = s * 0.985;
+        gl_FragColor = vec4(val < 0.003 ? 0.0 : val, 0.0, 0.0, 1.0);
+      }
+    `;
+
+    // 2. FBM 植物标本纸张着色器
+    const botanicalFS = `
+      precision highp float;
+      uniform sampler2D u_trail;
+      uniform vec2 u_res;
+      uniform float u_time;
+
+      float fract_v(float x) { return x - floor(x); }
+      float hash21(vec2 p) { return fract_v(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+      float noise2d(vec2 p) {
+        vec2 i = floor(p); vec2 f = fract(p);
+        vec2 u = f * f * (3.0 - 2.0 * f);
+        return mix(mix(hash21(i), hash21(i + vec2(1.0, 0.0)), u.x),
+                   mix(hash21(i + vec2(0.0, 1.0)), hash21(i + vec2(1.0, 1.0)), u.x), u.y);
+      }
+      float fbm(vec2 p) {
+        float v = 0.0; float a = 0.5;
+        for (int i = 0; i < 4; i++) { v += a * noise2d(p); p *= 2.0; a *= 0.5; }
+        return v;
+      }
+
+      void main() {
+        vec2 uv = gl_FragCoord.xy / u_res;
+        float val = texture2D(u_trail, uv).r;
+        float dist = clamp(length(uv - vec2(0.5)) * 2.0, 0.0, 1.0);
+        val = pow(val, 0.5 + dist * 0.4);
+
+        vec3 paper = vec3(0.96, 0.94, 0.90);
+        vec3 darkInk = vec3(0.12, 0.08, 0.06);
+        vec3 midInk = vec3(0.55, 0.48, 0.40);
+        vec3 col = mix(paper, mix(darkInk, midInk, dist), val);
+
+        float p_noise = smoothstep(0.35, 0.65, fbm(gl_FragCoord.xy * 0.04 + u_time * 0.05));
+        col = mix(col, paper, p_noise * (smoothstep(0.05, 0.25, val) * smoothstep(0.65, 0.35, val)) * 0.3);
+
+        float grain = (hash21(gl_FragCoord.xy * 1.1 + u_time) - 0.5) * 0.08;
+        gl_FragColor = vec4(clamp(col + vec3(grain), 0.0, 1.0), 1.0);
+      }
+    `;
+
+    const progDecay = createProgram(gl, baseVS, decayFS);
+    const progBotanical = createProgram(gl, baseVS, botanicalFS);
+
+    function makeFBO() {
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, RES, RES, 0, gl.RGBA, gl.FLOAT, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      const fbo = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      return { fbo, tex };
+    }
+    let fboA = makeFBO(), fboB = makeFBO();
+
+    // 质点属性表：[x, y, angle, active, gen, life, max_life, deposit]
+    const STRIDE = 8;
+    const pool = new Float32Array(MAX_AGENTS * STRIDE);
+    let alloc_ptr = 0;
+
+    function spawnBatch(cx, cy, count, is_disc, core_r, base_life) {
+      for (let k = 0; k < count; k++) {
+        const idx = (alloc_ptr++) % MAX_AGENTS;
+        const off = idx * STRIDE;
+        pool[off + 3] = 1.0; // active
+        pool[off + 4] = 0.0; // gen
+        const ml = base_life * (0.8 + Math.random() * 0.4);
+        pool[off + 5] = ml;  // life
+        pool[off + 6] = ml;  // max_life
+        pool[off + 7] = 1.0; // deposit_strength
+
+        if (is_disc) {
+          const r = Math.sqrt(Math.random()) * core_r;
+          const th = Math.random() * Math.PI * 2.0;
+          pool[off] = cx + Math.cos(th) * r;
+          pool[off + 1] = cy + Math.sin(th) * r;
+          pool[off + 2] = th + (Math.random() - 0.5) * 0.8;
+        } else {
+          pool[off] = cx + (Math.random() - 0.5) * 8.0;
+          pool[off + 1] = cy + (Math.random() - 0.5) * 8.0;
+          pool[off + 2] = Math.random() * Math.PI * 2.0;
+        }
+      }
+    }
+
+    const agentVS = `
+      attribute vec2 a_pos;
+      attribute float a_dep;
+      varying float v_dep;
+      uniform vec2 u_res;
+      void main() {
+        gl_Position = vec4((a_pos / u_res) * 2.0 - 1.0, 0.0, 1.0);
+        gl_PointSize = 1.0;
+        v_dep = a_dep;
+      }
+    `;
+    const agentFS = `precision highp float; varying float v_dep; void main() { gl_FragColor = vec4(v_dep, 0.0, 0.0, 1.0); }`;
+    const progAgent = createProgram(gl, agentVS, agentFS);
+
+    const quadBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
+
+    const agentPosDepBuf = gl.createBuffer();
+    const trailData = new Float32Array(RES * RES * 4);
+    spawnBatch(RES * 0.5, RES * 0.5, 200, 1, 50.0, 400.0);
+
+    canvas.addEventListener("mousedown", (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const mx = (e.clientX - rect.left) / rect.width * RES;
+      const my = (1.0 - (e.clientY - rect.top) / rect.height) * RES;
+      spawnBatch(mx, my, 80, 0, 8.0, 400.0);
+    });
+
+    let startTime = performance.now();
+
+    function loop() {
+      const u_time = (performance.now() - startTime) * 0.001;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fboA.fbo);
+      gl.readPixels(0, 0, RES, RES, gl.RGBA, gl.FLOAT, trailData);
+
+      // 周期性从根部出芽补种
+      spawnBatch(RES * 0.5, RES * 0.5, 4, 1, 50.0, 400.0);
+
+      const renderList = [];
+      for (let i = 0; i < MAX_AGENTS; i++) {
+        const off = i * STRIDE;
+        if (pool[off + 3] === 1.0) {
+          pool[off + 5] -= 1.0; // 寿命衰减
+          if (pool[off + 5] <= 0.0) { pool[off + 3] = 0.0; continue; }
+
+          let x = pool[off], y = pool[off + 1], ang = pool[off + 2];
+          const g = pool[off + 4];
+
+          const sample = (a, d) => {
+            const sx = Math.floor(x + Math.cos(a) * d);
+            const sy = Math.floor(y + Math.sin(a) * d);
+            if (sx >= 0 && sx < RES && sy >= 0 && sy < RES) return trailData[(sy * RES + sx) * 4];
+            return 0.0;
+          };
+
+          const vl = sample(ang - 0.5, 20.0), vc = sample(ang, 20.0), vr = sample(ang + 0.5, 20.0);
+          if (vc > vl && vc > vr) {}
+          else if (vc < vl && vc < vr) ang += (Math.random() - 0.5) * 0.4;
+          else if (vl > vr) ang -= 0.2;
+          else if (vr > vl) ang += 0.2;
+
+          // 代际概率分叉
+          const cur_f_ch = 0.012 * Math.pow(1.3, g);
+          if (g < 6 && Math.random() < cur_f_ch) {
+            const c_idx = (alloc_ptr++) % MAX_AGENTS;
+            const c_off = c_idx * STRIDE;
+            pool[c_off + 3] = 1.0; pool[c_off] = x; pool[c_off + 1] = y; pool[c_off + 4] = g + 1;
+            pool[c_off + 7] = pool[off + 7] * 0.55;
+            const sign = Math.random() > 0.5 ? 1.0 : -1.0;
+            const defl = 0.78 * (0.5 + Math.random() * 0.5);
+            pool[c_off + 2] = ang + sign * defl;
+            const c_ml = 400.0 * Math.pow(0.6, g + 1) * (0.8 + Math.random() * 0.4);
+            pool[c_off + 5] = pool[c_off + 6] = c_ml;
+            ang -= sign * defl * 0.15;
+          }
+
+          ang += (Math.random() - 0.5) * (0.08 + g * 0.04);
+          const spd = Math.max(0.3, 1.0 - g * 0.05);
+          x += Math.cos(ang) * spd; y += Math.sin(ang) * spd;
+
+          if (x < 0 || x >= RES || y < 0 || y >= RES) { pool[off + 3] = 0.0; }
+          else {
+            pool[off] = x; pool[off + 1] = y; pool[off + 2] = ang;
+            const dep = pool[off + 7] * (pool[off + 5] / pool[off + 6]);
+            renderList.push(x, y, dep);
+          }
+        }
+      }
+
+      // 1. 质点写入沉积
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fboA.fbo);
+      gl.useProgram(progAgent);
+      gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+      gl.bindBuffer(gl.ARRAY_BUFFER, agentPosDepBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(renderList), gl.DYNAMIC_DRAW);
+      const posLoc = gl.getAttribLocation(progAgent, "a_pos");
+      const depLoc = gl.getAttribLocation(progAgent, "a_dep");
+      gl.enableVertexAttribArray(posLoc); gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 12, 0);
+      gl.enableVertexAttribArray(depLoc); gl.vertexAttribPointer(depLoc, 1, gl.FLOAT, false, 12, 8);
+      gl.uniform2f(gl.getUniformLocation(progAgent, "u_res"), RES, RES);
+      gl.drawArrays(gl.POINTS, 0, renderList.length / 3);
+      gl.disable(gl.BLEND);
+
+      // 2. 卷积扩散衰减
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fboB.fbo);
+      gl.useProgram(progDecay);
+      gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+      const pLoc = gl.getAttribLocation(progDecay, "p");
+      gl.enableVertexAttribArray(pLoc); gl.vertexAttribPointer(pLoc, 2, gl.FLOAT, false, 0, 0);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fboA.tex);
+      gl.uniform1i(gl.getUniformLocation(progDecay, "u_trail"), 0);
+      gl.uniform2f(gl.getUniformLocation(progDecay, "u_res"), RES, RES);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+      let tmp = fboA; fboA = fboB; fboB = tmp;
+
+      // 3. 渲染植物纸张标本着色
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.useProgram(progBotanical);
+      gl.bindTexture(gl.TEXTURE_2D, fboA.tex);
+      gl.uniform1i(gl.getUniformLocation(progBotanical, "u_trail"), 0);
+      gl.uniform2f(gl.getUniformLocation(progBotanical, "u_res"), RES, RES);
+      gl.uniform1f(gl.getUniformLocation(progBotanical, "u_time"), u_time);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+      requestAnimationFrame(loop);
+    }
+    loop();
+  </script>
+</body>
+</html>
