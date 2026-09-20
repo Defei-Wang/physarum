@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Physarum v6.0 - Blind Foraging & Retrograde Flow</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #030406;
+      color: #94a3b8;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      overflow: hidden;
+    }
+    #stage {
+      position: relative;
+      width: 600px;
+      height: 600px;
+      background: #000;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.95);
+      border: 1px solid #1e293b;
+    }
+    canvas { width: 100%; height: 100%; display: block; cursor: crosshair; }
+    .hud-panel {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      background: rgba(15, 23, 42, 0.88);
+      border: 1px solid #334155;
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-size: 11px;
+      line-height: 1.6;
+      backdrop-filter: blur(6px);
+      user-select: none;
+    }
+    .hud-panel b { color: #facc15; font-size: 12px; }
+    .btn {
+      margin-top: 6px;
+      background: #ca8a04;
+      color: #fff;
+      border: none;
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .btn:hover { background: #a16207; }
+  </style>
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="cv" width="600" height="600"></canvas>
+  <div class="hud-panel">
+    <b>Physarum Engine v6.0 (Flagship)</b><br>
+    机制: 双向相变盲探 + 离心/向心势能场<br>
+    短程嗅探: 48px | 逆行回流分泌: 25x<br>
+    <span>[鼠标左键]: 在圆盘内投放高能燕麦</span><br>
+    <button class="btn" onclick="initSim()">全盘重置 (R)</button>
+  </div>
+</div>
+
+<script>
+const RES = 600;
+const N = 60000;
+const CENTER = RES * 0.5;
+const RADIUS = RES * 0.5 - 4.0;
+const CAP = 5.0;
+
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const imgData = ctx.createImageData(RES, RES);
+const buf32 = new Uint32Array(imgData.data.buffer);
+
+let trail = new Float32Array(RES * RES);
+let trailNew = new Float32Array(RES * RES);
+
+const px = new Float32Array(N);
+const py = new Float32Array(N);
+const th = new Float32Array(N);
+const state = new Uint8Array(N); // 0:死, 1:盲探者, 2:回流者
+const life = new Float32Array(N);
+let allocPtr = 0;
+
+const foods = [];
+for (let i = 0; i < 32; i++) foods.push({ x: 0, y: 0, energy: 0, active: 0 });
+let foodCursor = 0;
+
+function initSim() {
+  trail.fill(0);
+  trailNew.fill(0);
+  state.fill(0);
+  allocPtr = 0;
+  for (let i = 0; i < 32; i++) foods[i].active = 0;
+  foodCursor = 0;
+}
+
+function pumpCore() {
+  for (let k = 0; k < 500; k++) {
+    const idx = allocPtr % N;
+    allocPtr++;
+    state[idx] = 1;
+    life[idx] = 450.0;
+    const ang = Math.random() * Math.PI * 2.0;
+    const r = Math.sqrt(Math.random()) * 14.0;
+    px[idx] = CENTER + Math.cos(ang) * r;
+    py[idx] = CENTER + Math.sin(ang) * r;
+    th[idx] = ang + (Math.random() - 0.5) * 1.0;
+  }
+}
+
+function sampleField(x, y) {
+  const ix = Math.max(0, Math.min(RES - 1, x | 0));
+  const iy = Math.max(0, Math.min(RES - 1, y | 0));
+  return trail[iy * RES + ix];
+}
+
+function getFoodScent(x, y) {
+  let s = 0.0;
+  for (let f = 0; f < 32; f++) {
+    if (foods[f].active) {
+      const dist = Math.hypot(x - foods[f].x, y - foods[f].y);
+      if (dist < 48.0) s += 5.0 * (1.0 - dist / 48.0);
+    }
+  }
+  return s;
+}
+
+const SO = 11.0, SA = 0.785, RA = 0.785, SS = 1.35;
+const DEP_EXP = 0.05, DEP_RET = 1.80;
+
+function step() {
+  pumpCore();
+
+  for (let i = 0; i < N; i++) {
+    const st = state[i];
+    if (st === 0) continue;
+
+    life[i] -= 1.0;
+    if (life[i] <= 0) { state[i] = 0; continue; }
+
+    let x = px[i], y = py[i], h = th[i];
+    const fX = x + Math.cos(h) * SO, fY = y + Math.sin(h) * SO;
+    const lX = x + Math.cos(h + SA) * SO, lY = y + Math.sin(h + SA) * SO;
+    const rX = x + Math.cos(h - SA) * SO, rY = y + Math.sin(h - SA) * SO;
+
+    let Fv = sampleField(fX, fY), Lv = sampleField(lX, lY), Rv = sampleField(rX, rY);
+
+    if (st === 1) {
+      const outF = Math.hypot(fX - CENTER, fY - CENTER) * 0.022;
+      const outL = Math.hypot(lX - CENTER, lY - CENTER) * 0.022;
+      const outR = Math.hypot(rX - CENTER, rY - CENTER) * 0.022;
+      Fv = Fv * 0.45 + outF + getFoodScent(fX, fY);
+      Lv = Lv * 0.45 + outL + getFoodScent(lX, lY);
+      Rv = Rv * 0.45 + outR + getFoodScent(rX, rY);
+    } else {
+      const homeF = (800.0 - Math.hypot(fX - CENTER, fY - CENTER)) * 0.04;
+      const homeL = (800.0 - Math.hypot(lX - CENTER, lY - CENTER)) * 0.04;
+      const homeR = (800.0 - Math.hypot(rX - CENTER, rY - CENTER)) * 0.04;
+      Fv += homeF; Lv += homeL; Rv += homeR;
+    }
+
+    let turn = 0.0;
+    if (Fv > Lv && Fv > Rv) turn = 0.0;
+    else if (Fv < Lv && Fv < Rv) turn = Math.random() < 0.5 ? RA : -RA;
+    else if (Lv < Rv) turn = -RA;
+    else turn = RA;
+
+    turn += (Math.random() - 0.5) * (st === 1 ? 0.45 : 0.06);
+    h += turn;
+
+    x += Math.cos(h) * SS;
+    y += Math.sin(h) * SS;
+
+    if (st === 1) {
+      for (let f = 0; f < 32; f++) {
+        if (foods[f].active && Math.hypot(x - foods[f].x, y - foods[f].y) < 9.0) {
+          foods[f].energy -= 0.6;
+          if (foods[f].energy <= 0) foods[f].active = 0;
+          state[i] = 2; // 触碰相变为回流者
+          life[i] = 1000.0;
+          h += Math.PI + (Math.random() - 0.5) * 0.3; // 180° 反冲
+          break;
+        }
+      }
+    } else if (st === 2) {
+      if (Math.hypot(x - CENTER, y - CENTER) < 18.0) {
+        state[i] = 0; // 卸载归巢消亡
+        continue;
+      }
+    }
+
+    const dist = Math.hypot(x - CENTER, y - CENTER);
+    if (dist > RADIUS) {
+      const nx = (x - CENTER) / dist, ny = (y - CENTER) / dist;
+      const dot = Math.cos(h) * nx + Math.sin(h) * ny;
+      h = Math.atan2(Math.sin(h) - 2 * dot * ny, Math.cos(h) - 2 * dot * nx);
+      x = CENTER + nx * (RADIUS - 1.0);
+      y = CENTER + ny * (RADIUS - 1.0);
+    }
+
+    px[i] = x; py[i] = y; th[i] = h;
+
+    const ix = x | 0, iy = y | 0;
+    if (ix >= 0 && ix < RES && iy >= 0 && iy < RES) {
+      const idx = iy * RES + ix;
+      const dep = st === 1 ? DEP_EXP : DEP_RET;
+      trail[idx] += dep * (1.0 - Math.min(1.0, trail[idx] / CAP));
+    }
+  }
+
+  // 扩散与平滑
+  for (let y = 1; y < RES - 1; y++) {
+    const y0 = y * RES, ym1 = (y - 1) * RES, yp1 = (y + 1) * RES;
+    for (let x = 1; x < RES - 1; x++) {
+      const s = trail[ym1 + x - 1] + trail[ym1 + x] + trail[ym1 + x + 1] +
+                trail[y0 + x - 1]  + trail[y0 + x]  + trail[y0 + x + 1] +
+                trail[yp1 + x - 1] + trail[yp1 + x] + trail[yp1 + x + 1];
+      trailNew[y0 + x] = Math.min((trail[y0 + x] * 0.65 + (s / 9.0) * 0.35) * 0.984, CAP);
+    }
+  }
+  trail.set(trailNew);
+
+  // 伪 2.5D 微观浮雕渲染
+  for (let y = 0; y < RES; y++) {
+    const y0 = y * RES, ym1 = (y > 0 ? y - 1 : 0) * RES, yp1 = (y < RES - 1 ? y + 1 : RES - 1) * RES;
+    for (let x = 0; x < RES; x++) {
+      const idx = y0 + x;
+      if ((x - CENTER) ** 2 + (y - CENTER) ** 2 > RADIUS * RADIUS) {
+        buf32[idx] = 0xff060608;
+        continue;
+      }
+
+      const xm1 = x > 0 ? x - 1 : 0, xp1 = x < RES - 1 ? x + 1 : RES - 1;
+      const dHdx = (trail[y0 + xp1] - trail[y0 + xm1]) * 0.5;
+      const dHdy = (trail[yp1 + x] - trail[ym1 + x]) * 0.5;
+
+      const nx = -1.8 * dHdx, ny = -1.8 * dHdy, nz = 1.0;
+      const inv = 1.0 / Math.hypot(nx, ny, nz);
+      const ndotl = Math.max(0.0, (nx * 0.4 + ny * 0.5 + nz * 0.7) * inv);
+
+      const v = Math.min(1.0, Math.pow(trail[idx] / CAP, 0.6));
+      let r = 0, g = 0, b = 0;
+      if (v < 0.4) {
+        const t = v / 0.4;
+        r = 12 * (1 - t) + 45 * t;
+        g = 15 * (1 - t) + 85 * t;
+        b = 12 * (1 - t) + 18 * t;
+      } else {
+        const t = (v - 0.4) / 0.6;
+        r = 45 * (1 - t) + 250 * t;
+        g = 85 * (1 - t) + 235 * t;
+        b = 18 * (1 - t) + 60 * t;
+      }
+
+      const shade = Math.min(1.4, 0.45 + 0.75 * ndotl);
+      r = Math.min(255, (r * shade) | 0);
+      g = Math.min(255, (g * shade) | 0);
+      b = Math.min(255, (b * shade) | 0);
+
+      for (let f = 0; f < 32; f++) {
+        if (foods[f].active && Math.hypot(x - foods[f].x, y - foods[f].y) < 6.0) {
+          r = 220; g = 205; b = 160;
+        }
+      }
+
+      buf32[idx] = (255 << 24) | (b << 16) | (g << 8) | r;
+    }
+  }
+  ctx.putImageData(imgData, 0, 0);
+  requestAnimationFrame(step);
+}
+
+cv.addEventListener('mousedown', (e) => {
+  const rect = cv.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (RES / rect.width);
+  const y = (e.clientY - rect.top) * (RES / rect.height);
+  if (Math.hypot(x - CENTER, y - CENTER) < RADIUS - 10.0) {
+    const idx = foodCursor % 32;
+    foods[idx] = { x, y, energy: 2800.0, active: 1 };
+    foodCursor++;
+  }
+});
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'r' || e.key === 'R') initSim();
+});
+
+initSim();
+requestAnimationFrame(step);
+</script>
+</body>
+</html>
