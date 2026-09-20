@@ -3,11 +3,11 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Physarum Polycephalum Morphogenesis</title>
+  <title>Physarum Polycephalum Morphogenesis Suite</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      background: #0d0e12;
+      background: #090a0f;
       color: #e2e8f0;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
       display: flex;
@@ -16,13 +16,14 @@
       overflow: hidden;
     }
     header {
-      background: #161822;
-      border-bottom: 1px solid #272a38;
-      padding: 10px 20px;
+      background: #12141c;
+      border-bottom: 1px solid #1e2330;
+      padding: 0 20px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      height: 56px;
+      height: 54px;
+      flex-shrink: 0;
     }
     .brand {
       display: flex;
@@ -30,30 +31,31 @@
       gap: 12px;
     }
     .brand h1 {
-      font-size: 16px;
-      letter-spacing: 0.5px;
+      font-size: 15px;
       font-weight: 600;
+      letter-spacing: 0.5px;
     }
     .nav-tags {
       display: flex;
-      gap: 8px;
+      gap: 6px;
       overflow-x: auto;
       align-items: center;
     }
     .tag-btn {
-      background: #232738;
+      background: #1e2230;
       color: #94a3b8;
-      border: 1px solid #33394d;
-      padding: 6px 14px;
+      border: 1px solid #2e3547;
+      padding: 5px 12px;
       border-radius: 4px;
-      font-size: 13px;
+      font-size: 12px;
       cursor: pointer;
       font-family: monospace;
-      transition: all 0.2s;
+      transition: all 0.15s ease;
+      white-space: nowrap;
     }
     .tag-btn:hover {
-      background: #2e344a;
-      color: #f1f5f9;
+      background: #282f44;
+      color: #f8fafc;
     }
     .tag-btn.active {
       background: #eab308;
@@ -64,82 +66,37 @@
     #viewport {
       flex: 1;
       width: 100%;
-      height: calc(100vh - 56px);
+      height: 100%;
       border: none;
-      background: #000000;
-    }
-    .status {
-      font-size: 12px;
-      color: #64748b;
-      margin-left: 10px;
+      background: #030406;
+      display: block;
     }
   </style>
 </head>
 <body>
   <header>
     <div class="brand">
-      <h1>Physarum Polycephalum</h1>
-      <span id="api-status" class="status">Loading tags...</span>
+      <h1>Physarum Simulation Suite</h1>
     </div>
     <div class="nav-tags" id="tag-container">
-      <!-- 完整版本保底按钮：默认高亮 v6.0 -->
-      <button class="tag-btn" onclick="loadVersion('v1.html', this)">v1.0</button>
-      <button class="tag-btn" onclick="loadVersion('v2.html', this)">v2.0</button>
-      <button class="tag-btn" onclick="loadVersion('v3.html', this)">v3.0</button>
-      <button class="tag-btn" onclick="loadVersion('v4.html', this)">v4.0</button>
-      <button class="tag-btn" onclick="loadVersion('v5.html', this)">v5.0</button>
-      <button class="tag-btn active" onclick="loadVersion('v6.html', this)">v6.0</button>
+      <button class="tag-btn" onclick="loadVersion('v1.html', this)">v1.0 Baseline</button>
+      <button class="tag-btn" onclick="loadVersion('v2.html', this)">v2.0 Archival</button>
+      <button class="tag-btn" onclick="loadVersion('v3.html', this)">v3.0 Space Graph</button>
+      <button class="tag-btn" onclick="loadVersion('v3.1.html', this)">v3.1 Tokyo Railway</button>
+      <button class="tag-btn" onclick="loadVersion('v4.html', this)">v4.0 Ping-Pong</button>
+      <button class="tag-btn" onclick="loadVersion('v5.html', this)">v5.0 Antagonism</button>
+      <button class="tag-btn active" onclick="loadVersion('v6.html', this)">v6.0 Flagship</button>
     </div>
   </header>
 
-  <!-- 默认加载最新一代 v6.html -->
   <iframe id="viewport" src="v6.html"></iframe>
 
   <script>
-    const GITHUB_REPO = "Defei-Wang/physarum";
-
     function loadVersion(url, btn) {
       document.getElementById('viewport').src = url;
       document.querySelectorAll('.tag-btn').forEach(b => b.classList.remove('active'));
       if (btn) btn.classList.add('active');
     }
-
-    async function fetchGitHubTags() {
-      const statusEl = document.getElementById('api-status');
-      const container = document.getElementById('tag-container');
-
-      try {
-        const res = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/tags`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const tags = await res.json();
-        
-        if (tags && tags.length > 0) {
-          container.innerHTML = "";
-          // 按版本自然排序升序 (v1.0 -> v6.0)
-          const sortedTags = tags.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
-
-          sortedTags.forEach((tag, idx) => {
-            const btn = document.createElement('button');
-            const isLatest = idx === sortedTags.length - 1;
-            btn.className = `tag-btn ${isLatest ? 'active' : ''}`;
-            btn.innerText = tag.name;
-            
-            const majorMatch = tag.name.match(/v(\d+)/i);
-            const targetHtml = majorMatch ? `v${majorMatch[1]}.html` : `${tag.name}.html`;
-            
-            btn.onclick = () => loadVersion(targetHtml, btn);
-            container.appendChild(btn);
-
-            if (isLatest) loadVersion(targetHtml, btn);
-          });
-          statusEl.innerText = `Synchronized: ${tags.length} tags (Latest: ${sortedTags[sortedTags.length - 1].name})`;
-        }
-      } catch (err) {
-        statusEl.innerText = `API Cached / Offline (Serving default)`;
-      }
-    }
-
-    fetchGitHubTags();
   </script>
 </body>
 </html>

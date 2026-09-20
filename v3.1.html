@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Physarum v3.1 - Tokyo Railway Simulator (SCA & Retrograde Pruning)</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #040507;
+      color: #94a3b8;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      overflow: hidden;
+    }
+    #stage {
+      position: relative;
+      width: 600px;
+      height: 600px;
+      background: #000;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.95);
+      border: 1px solid #1e293b;
+    }
+    canvas { width: 100%; height: 100%; display: block; cursor: crosshair; }
+    .hud-panel {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      width: 270px;
+      background: rgba(15, 23, 42, 0.90);
+      border: 1px solid #334155;
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-size: 11px;
+      line-height: 1.5;
+      backdrop-filter: blur(5px);
+      user-select: none;
+    }
+    .hud-panel b { color: #facc15; font-size: 12px; }
+    .status-text { margin-top: 5px; font-weight: 600; }
+    .status-awaiting { color: #eab308; }
+    .status-active { color: #22c55e; }
+    .status-paused { color: #ef4444; }
+    .btn {
+      margin-top: 8px;
+      width: 100%;
+      background: #334155;
+      color: #f8fafc;
+      border: none;
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .btn:hover { background: #475569; }
+  </style>
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="cv" width="600" height="600"></canvas>
+  <div class="hud-panel">
+    <b>Physarum v3.1 (Tokyo Railway SCA)</b><br>
+    机制: 空间殖民图 + 逆行通量水力粗化 + 代谢凋亡<br>
+    操作: [鼠标右键] 接种母核 | [鼠标左键] 投放燕麦<br>
+    控制: [空格键] 暂停/推进 | [R] 重置培养皿
+    <hr style="border:0; border-top:1px solid #334155; margin:6px 0;">
+    <div id="status-display" class="status-text status-awaiting">
+      STATUS: [等待接种] 请在培养皿内右键点击！
+    </div>
+    <div id="metric-display" style="color: #64748b; margin-top: 2px;">
+      Vascular Nodes: 0 / 15000
+    </div>
+    <button class="btn" onclick="resetSimulation()">全盘清空重置 (R)</button>
+  </div>
+</div>
+
+<script>
+const RES = 600;
+const DISH_RADIUS = RES * 0.465;
+const CENTER_X = RES * 0.5;
+const CENTER_Y = RES * 0.5;
+
+const MAX_NODES = 15000;
+const MAX_ATTRS = 14000;
+const MAX_FOODS = 32;
+
+const KILL_DIST = 5.0;
+const ATTRACT_DIST = 26.0;
+const STEP_SIZE = 2.2;
+const BROWNIAN_NOISE = 0.22;
+const MAX_BRANCH = 3;
+
+const CELL_SIZE = 28.0;
+const GRID_W = Math.ceil(RES / CELL_SIZE);
+const GRID_H = Math.ceil(RES / CELL_SIZE);
+const gridBuckets = new Int32Array(GRID_W * GRID_H * 64);
+const gridCounts = new Int32Array(GRID_W * GRID_H);
+
+const nodePosX = new Float32Array(MAX_NODES);
+const nodePosY = new Float32Array(MAX_NODES);
+const nodeParent = new Int32Array(MAX_NODES);
+const nodeDepth = new Int32Array(MAX_NODES);
+const nodeFlow = new Float32Array(MAX_NODES);
+const nodeVitality = new Float32Array(MAX_NODES);
+const nodeActive = new Uint8Array(MAX_NODES);
+const nodeChildren = new Uint8Array(MAX_NODES);
+const nodeDirX = new Float32Array(MAX_NODES);
+const nodeDirY = new Float32Array(MAX_NODES);
+const nodePullCount = new Int32Array(MAX_NODES);
+let nodeCount = 0;
+
+const attrPosX = new Float32Array(MAX_ATTRS);
+const attrPosY = new Float32Array(MAX_ATTRS);
+const attrActive = new Uint8Array(MAX_ATTRS);
+let attrCursor = 0;
+
+const foods = [];
+for (let i = 0; i < MAX_FOODS; i++) {
+  foods.push({ x: 0, y: 0, energy: 0, active: 0, eating: 0 });
+}
+
+let isInoculated = false;
+let isPaused = false;
+
+const trail = new Float32Array(RES * RES);
+const trailBlur = new Float32Array(RES * RES);
+
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const imgData = ctx.createImageData(RES, RES);
+const buf32 = new Uint32Array(imgData.data.buffer);
+
+function resetSimulation() {
+  isInoculated = false;
+  nodeCount = 0;
+  attrCursor = 0;
+  nodeActive.fill(0);
+  attrActive.fill(0);
+  trail.fill(0);
+  trailBlur.fill(0);
+  for (let i = 0; i < MAX_FOODS; i++) foods[i].active = 0;
+  updateHUD();
+}
+
+function inoculateSlimeMold(px, py) {
+  nodeCount = 1;
+  nodePosX[0] = px;
+  nodePosY[0] = py;
+  nodeParent[0] = -1;
+  nodeDepth[0] = 0;
+  nodeFlow[0] = 2.0;
+  nodeVitality[0] = 1.0;
+  nodeActive[0] = 1;
+  nodeChildren[0] = 0;
+
+  for (let i = 0; i < 7000; i++) {
+    const idx = attrCursor % MAX_ATTRS;
+    attrCursor++;
+    const th = Math.random() * Math.PI * 2.0;
+    const r = Math.sqrt(Math.random()) * (DISH_RADIUS - 8.0);
+    attrPosX[idx] = CENTER_X + Math.cos(th) * r;
+    attrPosY[idx] = CENTER_Y + Math.sin(th) * r;
+    attrActive[idx] = 1;
+  }
+  isInoculated = true;
+  updateHUD();
+}
+
+function addFoodSite(px, py, energy) {
+  let target = -1;
+  for (let f = 0; f < MAX_FOODS; f++) {
+    if (!foods[f].active && target === -1) target = f;
+  }
+  if (target !== -1) {
+    foods[target] = { x: px, y: py, energy: energy, active: 1, eating: 0 };
+    for (let i = 0; i < 240; i++) {
+      const idx = attrCursor % MAX_ATTRS;
+      attrCursor++;
+      const r = Math.sqrt(Math.random()) * 26.0;
+      const th = Math.random() * Math.PI * 2.0;
+      attrPosX[idx] = px + Math.cos(th) * r;
+      attrPosY[idx] = py + Math.sin(th) * r;
+      attrActive[idx] = 1;
+    }
+  }
+}
+
+function binNodes() {
+  gridCounts.fill(0);
+  for (let i = 0; i < nodeCount; i++) {
+    if (nodeActive[i]) {
+      const gx = (nodePosX[i] / CELL_SIZE) | 0;
+      const gy = (nodePosY[i] / CELL_SIZE) | 0;
+      if (gx >= 0 && gx < GRID_W && gy >= 0 && gy < GRID_H) {
+        const c = gridCounts[gy * GRID_W + gx];
+        if (c < 64) {
+          gridBuckets[(gy * GRID_W + gx) * 64 + c] = i;
+          gridCounts[gy * GRID_W + gx]++;
+        }
+      }
+    }
+  }
+}
+
+function scaSearchAndPull() {
+  nodeDirX.fill(0, 0, nodeCount);
+  nodeDirY.fill(0, 0, nodeCount);
+  nodePullCount.fill(0, 0, nodeCount);
+
+  for (let i = 0; i < MAX_ATTRS; i++) {
+    if (!attrActive[i]) continue;
+    const ax = attrPosX[i], ay = attrPosY[i];
+    const gx = (ax / CELL_SIZE) | 0;
+    const gy = (ay / CELL_SIZE) | 0;
+
+    let minD = ATTRACT_DIST;
+    let minIdx = -1;
+
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const cx = gx + dx, cy = gy + dy;
+        if (cx >= 0 && cx < GRID_W && cy >= 0 && cy < GRID_H) {
+          const count = gridCounts[cy * GRID_W + cx];
+          const offset = (cy * GRID_W + cx) * 64;
+          for (let k = 0; k < count; k++) {
+            const nIdx = gridBuckets[offset + k];
+            if (nodeActive[nIdx]) {
+              const d = Math.hypot(ax - nodePosX[nIdx], ay - nodePosY[nIdx]);
+              if (d < minD) {
+                minD = d;
+                minIdx = nIdx;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (minD < KILL_DIST) {
+      attrActive[i] = 0;
+    } else if (minIdx !== -1) {
+      const invD = 1.0 / (minD + 1e-4);
+      nodeDirX[minIdx] += (ax - nodePosX[minIdx]) * invD;
+      nodeDirY[minIdx] += (ay - nodePosY[minIdx]) * invD;
+      nodePullCount[minIdx]++;
+    }
+  }
+}
+
+function scaGrow() {
+  const currentCount = nodeCount;
+  for (let i = 0; i < currentCount; i++) {
+    if (nodeActive[i] && nodePullCount[i] > 0 && nodeChildren[i] < MAX_BRANCH) {
+      if (nodeCount < MAX_NODES) {
+        const len = Math.hypot(nodeDirX[i], nodeDirY[i]);
+        if (len > 0.001) {
+          let ang = Math.atan2(nodeDirY[i], nodeDirX[i]) + (Math.random() - 0.5) * BROWNIAN_NOISE;
+          const nx = nodePosX[i] + Math.cos(ang) * STEP_SIZE;
+          const ny = nodePosY[i] + Math.sin(ang) * STEP_SIZE;
+
+          if (Math.hypot(nx - CENTER_X, ny - CENTER_Y) < DISH_RADIUS - 2.0) {
+            const idx = nodeCount++;
+            nodePosX[idx] = nx;
+            nodePosY[idx] = ny;
+            nodeParent[idx] = i;
+            nodeDepth[idx] = nodeDepth[i] + 1;
+            nodeFlow[idx] = 0.12;
+            nodeVitality[idx] = 1.0;
+            nodeActive[idx] = 1;
+            nodeChildren[idx] = 0;
+            nodeChildren[i]++;
+          }
+        }
+      }
+    }
+  }
+}
+
+function retrogradeAndPrune() {
+  for (let f = 0; f < MAX_FOODS; f++) {
+    foods[f].eating = 0;
+    if (foods[f].active) {
+      const fx = foods[f].x, fy = foods[f].y;
+      const gx = (fx / CELL_SIZE) | 0, gy = (fy / CELL_SIZE) | 0;
+      let nearest = -1;
+      let minD = 18.0;
+
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const cx = gx + dx, cy = gy + dy;
+          if (cx >= 0 && cx < GRID_W && cy >= 0 && cy < GRID_H) {
+            const count = gridCounts[cy * GRID_W + cx];
+            const offset = (cy * GRID_W + cx) * 64;
+            for (let k = 0; k < count; k++) {
+              const nIdx = gridBuckets[offset + k];
+              if (nodeActive[nIdx]) {
+                const d = Math.hypot(fx - nodePosX[nIdx], fy - nodePosY[nIdx]);
+                if (d < minD) { minD = d; nearest = nIdx; }
+              }
+            }
+          }
+        }
+      }
+
+      if (nearest !== -1) {
+        foods[f].eating = 1;
+        let curr = nearest;
+        let depthLimit = 0;
+        while (curr !== -1 && depthLimit < 400) {
+          nodeFlow[curr] += 0.55;
+          nodeVitality[curr] = 1.0;
+          curr = nodeParent[curr];
+          depthLimit++;
+        }
+      }
+    }
+  }
+
+  for (let f = 0; f < MAX_FOODS; f++) {
+    if (foods[f].active && foods[f].eating) {
+      foods[f].energy -= 0.6;
+      if (foods[f].energy <= 0) foods[f].active = 0;
+    }
+  }
+
+  if (nodeCount > 0) {
+    nodeVitality[0] = 1.0;
+    nodeActive[0] = 1;
+  }
+
+  for (let i = 1; i < nodeCount; i++) {
+    if (nodeActive[i]) {
+      nodeFlow[i] *= 0.955;
+      if (nodeFlow[i] < 0.16) {
+        nodeVitality[i] -= 0.0035;
+        if (nodeVitality[i] <= 0) {
+          nodeVitality[i] = 0;
+          nodeActive[i] = 0;
+        }
+      } else {
+        nodeVitality[i] = Math.min(1.0, nodeVitality[i] + 0.02);
+      }
+    }
+  }
+}
+
+function rasterize(curT) {
+  for (let i = 0; i < RES * RES; i++) trail[i] *= 0.88;
+
+  for (let i = 1; i < nodeCount; i++) {
+    if (nodeVitality[i] > 0.005) {
+      const pIdx = nodeParent[i];
+      if (pIdx >= 0 && nodeVitality[pIdx] > 0.005) {
+        const x0 = nodePosX[pIdx], y0 = nodePosY[pIdx];
+        const x1 = nodePosX[i], y1 = nodePosY[i];
+        const dist = Math.hypot(x1 - x0, y1 - y0);
+        const steps = Math.max(1, Math.ceil(dist * 1.4));
+
+        const vit = nodeVitality[i];
+        const flow = nodeFlow[i];
+        const dep = nodeDepth[i];
+
+        const thick = (0.70 * vit + flow * 2.8) * Math.exp(-0.010 * dep);
+        const shuttle = 1.0 + 0.20 * Math.sin(curT * 4.0 - dep * 0.22);
+        const deposit = thick * vit * shuttle * 0.45;
+
+        for (let s = 0; s <= steps; s++) {
+          const t = s / steps;
+          const px = (x0 * (1 - t) + x1 * t) | 0;
+          const py = (y0 * (1 - t) + y1 * t) | 0;
+          if (px >= 1 && px < RES - 1 && py >= 1 && py < RES - 1) {
+            trail[py * RES + px] += deposit;
+          }
+        }
+      }
+    }
+  }
+}
+
+function filterNormal() {
+  const inv9 = 1.0 / 9.0;
+  for (let y = 1; y < RES - 1; y++) {
+    const y0 = y * RES, ym1 = (y - 1) * RES, yp1 = (y + 1) * RES;
+    for (let x = 1; x < RES - 1; x++) {
+      trailBlur[y0 + x] = (
+        trail[ym1 + x - 1] + trail[ym1 + x] + trail[ym1 + x + 1] +
+        trail[y0 + x - 1]  + trail[y0 + x]  + trail[y0 + x + 1] +
+        trail[yp1 + x - 1] + trail[yp1 + x] + trail[yp1 + x + 1]
+      ) * inv9;
+    }
+  }
+}
+
+function render(curT) {
+  const lx = 0.52, ly = 0.68, lz = 0.50;
+  const lNorm = 1.0 / Math.hypot(lx, ly, lz);
+  const nxL = lx * lNorm, nyL = ly * lNorm, nzL = lz * lNorm;
+
+  for (let y = 0; y < RES; y++) {
+    const y0 = y * RES;
+    const ym1 = Math.max(0, y - 1) * RES;
+    const yp1 = Math.min(RES - 1, y + 1) * RES;
+
+    for (let x = 0; x < RES; x++) {
+      const idx = y0 + x;
+      const dDish = Math.hypot(x - CENTER_X, y - CENTER_Y);
+
+      if (dDish > DISH_RADIUS) {
+        buf32[idx] = 0xff040507;
+        continue;
+      }
+
+      const xm1 = Math.max(0, x - 1);
+      const xp1 = Math.min(RES - 1, x + 1);
+
+      const dx = (trailBlur[yp1 + xp1] + 2 * trailBlur[y0 + xp1] + trailBlur[ym1 + xp1]) -
+                 (trailBlur[yp1 + xm1] + 2 * trailBlur[y0 + xm1] + trailBlur[ym1 + xm1]);
+      const dy = (trailBlur[yp1 + xm1] + 2 * trailBlur[yp1 + x] + trailBlur[yp1 + xp1]) -
+                 (trailBlur[ym1 + xm1] + 2 * trailBlur[ym1 + x] + trailBlur[ym1 + xp1]);
+
+      const nX = -dx * 0.36;
+      const nY = -dy * 0.36;
+      const nZ = 1.0;
+      const nInv = 1.0 / Math.hypot(nX, nY, nZ);
+
+      const dotL = Math.max(0.0, (nX * nxL + nY * nyL + nZ * nzL) * nInv);
+      const halfLambert = Math.pow(dotL * 0.5 + 0.5, 2.0);
+
+      const val = trailBlur[idx];
+      const mTentacle = Math.min(1.0, val * 0.38);
+      const mVein = Math.pow(Math.min(1.0, val * 0.12), 2.2);
+      const mArtery = Math.pow(Math.min(1.0, val * 0.035), 3.8);
+
+      let r = 10, g = 9, b = 8;
+      r = r * (1 - mTentacle) + 140 * mTentacle;
+      g = g * (1 - mTentacle) + 153 * mTentacle;
+      b = b * (1 - mTentacle) + 40  * mTentacle;
+
+      r = r * (1 - mVein) + 245 * mVein;
+      g = g * (1 - mVein) + 209 * mVein;
+      b = b * (1 - mVein) + 40  * mVein;
+
+      r = r * (1 - mArtery) + 255 * mArtery;
+      g = g * (1 - mArtery) + 250 * mArtery;
+      b = b * (1 - mArtery) + 220 * mArtery;
+
+      const lit = 0.24 + halfLambert * 0.88;
+      r = Math.min(255, (r * lit) | 0);
+      g = Math.min(255, (g * lit) | 0);
+      b = Math.min(255, (b * lit) | 0);
+
+      for (let f = 0; f < MAX_FOODS; f++) {
+        if (foods[f].active) {
+          const df = Math.hypot(x - foods[f].x, y - foods[f].y);
+          const rOat = 6.5 * Math.sqrt(foods[f].energy / 30000.0);
+          if (df < rOat) {
+            const alpha = Math.min(0.92, foods[f].energy / 2000.0);
+            r = (r * (1 - alpha) + 224 * alpha) | 0;
+            g = (g * (1 - alpha) + 209 * alpha) | 0;
+            b = (b * (1 - alpha) + 165 * alpha) | 0;
+          }
+        }
+      }
+
+      if (!isInoculated) {
+        const pulseR = 18.0 + 3.0 * Math.sin(curT * 5.0);
+        const diffR = Math.abs(dDish - pulseR);
+        if (diffR < 1.8) {
+          const alphaPulse = (1.0 - diffR / 1.8) * 0.75;
+          r = (r * (1 - alphaPulse) + 242 * alphaPulse) | 0;
+          g = (g * (1 - alphaPulse) + 209 * alphaPulse) | 0;
+          b = (b * (1 - alphaPulse) + 51  * alphaPulse) | 0;
+        }
+      }
+
+      const wallMargin = DISH_RADIUS - dDish;
+      if (wallMargin < 10.0) {
+        const shadow = 0.4 + (wallMargin / 10.0) * 0.6;
+        r = (r * shadow) | 0; g = (g * shadow) | 0; b = (b * shadow) | 0;
+      }
+
+      buf32[idx] = (255 << 24) | (b << 16) | (g << 8) | r;
+    }
+  }
+  ctx.putImageData(imgData, 0, 0);
+}
+
+function updateHUD() {
+  const statusEl = document.getElementById('status-display');
+  const metricEl = document.getElementById('metric-display');
+
+  if (!isInoculated) {
+    statusEl.className = "status-text status-awaiting";
+    statusEl.innerText = "STATUS: [等待接种] 请在培养皿内右键点击！";
+  } else if (isPaused) {
+    statusEl.className = "status-text status-paused";
+    statusEl.innerText = "STATUS: [已暂停] 按空格键继续推进";
+  } else {
+    statusEl.className = "status-text status-active";
+    statusEl.innerText = `STATUS: [活跃演化化生中]`;
+  }
+  metricEl.innerText = `Vascular Nodes: ${nodeCount} / ${MAX_NODES}`;
+}
+
+let startT = performance.now();
+function loop() {
+  const curT = (performance.now() - startT) * 0.001;
+
+  if (isInoculated && !isPaused) {
+    binNodes();
+    scaSearchAndPull();
+    if (nodeCount < MAX_NODES - 150) {
+      scaGrow();
+    }
+    retrogradeAndPrune();
+  }
+
+  rasterize(curT);
+  filterNormal();
+  render(curT);
+
+  if (isInoculated && (frameCount++ % 15 === 0)) updateHUD();
+  requestAnimationFrame(loop);
+}
+
+let frameCount = 0;
+
+cv.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  const rect = cv.getBoundingClientRect();
+  const px = (e.clientX - rect.left) * (RES / rect.width);
+  const py = (e.clientY - rect.top) * (RES / rect.height);
+  if (Math.hypot(px - CENTER_X, py - CENTER_Y) <= DISH_RADIUS) {
+    inoculateSlimeMold(px, py);
+  }
+});
+
+cv.addEventListener('mousedown', (e) => {
+  if (e.button === 0) {
+    const rect = cv.getBoundingClientRect();
+    const px = (e.clientX - rect.left) * (RES / rect.width);
+    const py = (e.clientY - rect.top) * (RES / rect.height);
+    if (Math.hypot(px - CENTER_X, py - CENTER_Y) <= DISH_RADIUS) {
+      addFoodSite(px, py, 30000.0);
+    }
+  }
+});
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space') {
+    e.preventDefault();
+    isPaused = !isPaused;
+    updateHUD();
+  } else if (e.key === 'r' || e.key === 'R') {
+    resetSimulation();
+  }
+});
+
+resetSimulation();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
