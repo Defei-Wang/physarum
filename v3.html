@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Physarum v3.0 - Restored Phenotype & Kinetics Control</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #08090b;
+      color: #94a3b8;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      overflow: hidden;
+    }
+    #stage {
+      position: relative;
+      width: 600px;
+      height: 600px;
+      background: #000;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.9);
+      border: 1px solid #1e293b;
+    }
+    canvas { width: 100%; height: 100%; display: block; }
+    .control-panel {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      width: 250px;
+      background: rgba(15, 23, 42, 0.92);
+      border: 1px solid #334155;
+      padding: 12px 14px;
+      border-radius: 6px;
+      font-size: 11px;
+      line-height: 1.5;
+      backdrop-filter: blur(6px);
+      user-select: none;
+    }
+    .control-panel b { color: #a3e635; font-size: 12px; }
+    .slider-group { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+    .slider-row { display: flex; justify-content: space-between; align-items: center; }
+    .slider-row span { color: #94a3b8; font-size: 10px; }
+    .slider-row input[type=range] { width: 105px; cursor: pointer; }
+    .btn {
+      margin-top: 10px;
+      width: 100%;
+      background: #65a30d;
+      color: #fff;
+      border: none;
+      padding: 5px;
+      border-radius: 4px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .btn:hover { background: #4d7c0f; }
+  </style>
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="cv" width="600" height="600"></canvas>
+  <div class="control-panel">
+    <b>Kinetics Control (Taichi GGUI 映射)</b><br>
+    <span id="phase-label" style="color: #cbd5e1;">Phase: Blind Exploration</span>
+    <div class="slider-group">
+      <div class="slider-row">
+        <span>Sensor Distance (SO)</span>
+        <input type="range" id="so" min="4" max="20" step="0.5" value="11">
+      </div>
+      <div class="slider-row">
+        <span>Sensor Angle (SA)</span>
+        <input type="range" id="sa" min="10" max="60" step="1" value="30">
+      </div>
+      <div class="slider-row">
+        <span>Turn Angle (RA)</span>
+        <input type="range" id="ra" min="10" max="90" step="1" value="45">
+      </div>
+      <div class="slider-row">
+        <span>Secretion Rate</span>
+        <input type="range" id="dep" min="0.1" max="4" step="0.1" value="1.2">
+      </div>
+      <div class="slider-row">
+        <span>Decay (Evaporation)</span>
+        <input type="range" id="decay" min="0.01" max="0.1" step="0.005" value="0.045">
+      </div>
+    </div>
+    <button class="btn" onclick="initSimulation()">重新接种 (Re-Inoculate)</button>
+  </div>
+</div>
+
+<script>
+const RES = 600;
+const N = 35000;
+const CENTER = RES * 0.5;
+const RADIUS = RES * 0.5 - 4.0;
+const CAP = 5.0;
+
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const imgData = ctx.createImageData(RES, RES);
+const buf32 = new Uint32Array(imgData.data.buffer);
+
+let trail = new Float32Array(RES * RES);
+let trailNew = new Float32Array(RES * RES);
+let scent = new Float32Array(RES * RES);
+
+const px = new Float32Array(N);
+const py = new Float32Array(N);
+const th = new Float32Array(N);
+
+const foodPos = [
+  { x: 0, y: 0 }, { x: 0, y: 0 }, { x: 0, y: 0 }
+];
+
+let frame = 0;
+const EXPLORE_STEPS = 250;
+const FOOD_RAMP_STEPS = 150;
+
+function initFoods() {
+  for (let k = 0; k < 3; k++) {
+    const ang = (k / 3.0) * Math.PI * 2.0 + 0.4;
+    const r = RADIUS * 0.65;
+    foodPos[k].x = CENTER + Math.cos(ang) * r;
+    foodPos[k].y = CENTER + Math.sin(ang) * r;
+  }
+
+  scent.fill(0);
+  const sigma = 50.0;
+  for (let y = 0; y < RES; y++) {
+    const y0 = y * RES;
+    for (let x = 0; x < RES; x++) {
+      let acc = 0.0;
+      for (let k = 0; k < 3; k++) {
+        const dsq = (x - foodPos[k].x) ** 2 + (y - foodPos[k].y) ** 2;
+        acc += Math.exp(-dsq / (2 * sigma * sigma));
+      }
+      scent[y0 + x] = Math.min(acc, 1.0);
+    }
+  }
+}
+
+function initSimulation() {
+  trail.fill(0);
+  trailNew.fill(0);
+  frame = 0;
+  initFoods();
+
+  for (let i = 0; i < N; i++) {
+    const ang = Math.random() * Math.PI * 2.0;
+    const r = 25.0 * Math.sqrt(Math.random());
+    px[i] = CENTER + Math.cos(ang) * r;
+    py[i] = CENTER + Math.sin(ang) * r;
+    th[i] = ang + (Math.random() - 0.5) * 1.5;
+  }
+}
+
+function sampleField(f, x, y) {
+  const ix = Math.max(0, Math.min(RES - 1, x | 0));
+  const iy = Math.max(0, Math.min(RES - 1, y | 0));
+  return f[iy * RES + ix];
+}
+
+function step() {
+  frame++;
+  let fb = 0.0;
+  const phaseLabel = document.getElementById('phase-label');
+  if (frame < EXPLORE_STEPS) {
+    fb = 0.0;
+    phaseLabel.innerText = `Phase: Blind Radial Explore (${frame}/${EXPLORE_STEPS})`;
+    phaseLabel.style.color = '#cbd5e1';
+  } else {
+    fb = 0.35 * Math.min(1.0, (frame - EXPLORE_STEPS) / FOOD_RAMP_STEPS);
+    phaseLabel.innerText = `Phase: Scent Guidance (${(fb/0.35*100).toFixed(0)}%)`;
+    phaseLabel.style.color = '#a3e635';
+  }
+
+  const so = parseFloat(document.getElementById('so').value);
+  const sa = parseFloat(document.getElementById('sa').value) * Math.PI / 180.0;
+  const ra = parseFloat(document.getElementById('ra').value) * Math.PI / 180.0;
+  const deposit = parseFloat(document.getElementById('dep').value);
+  const decay = parseFloat(document.getElementById('decay').value);
+
+  for (let i = 0; i < N; i++) {
+    let x = px[i], y = py[i], angle = th[i];
+
+    const fX = x + Math.cos(angle) * so, fY = y + Math.sin(angle) * so;
+    const lX = x + Math.cos(angle - sa) * so, lY = y + Math.sin(angle - sa) * so;
+    const rX = x + Math.cos(angle + sa) * so, rY = y + Math.sin(angle + sa) * so;
+
+    const Fv = sampleField(trail, fX, fY) + fb * sampleField(scent, fX, fY);
+    const Lv = sampleField(trail, lX, lY) + fb * sampleField(scent, lX, lY);
+    const Rv = sampleField(trail, rX, rY) + fb * sampleField(scent, rX, rY);
+
+    let turn = 0.0;
+    if (Fv > Lv && Fv > Rv) turn = 0.0;
+    else if (Fv < Lv && Fv < Rv) turn = Math.random() < 0.5 ? ra : -ra;
+    else if (Lv < Rv) turn = -ra;
+    else turn = ra;
+
+    turn += (Math.random() - 0.5) * 0.15;
+    angle += turn;
+
+    x += Math.cos(angle) * 1.0;
+    y += Math.sin(angle) * 1.0;
+
+    const relX = x - CENTER, relY = y - CENTER;
+    const dist = Math.hypot(relX, relY);
+    if (dist > RADIUS) {
+      const nx = relX / dist, ny = relY / dist;
+      const dot = Math.cos(angle) * nx + Math.sin(angle) * ny;
+      angle = Math.atan2(Math.sin(angle) - 2 * dot * ny, Math.cos(angle) - 2 * dot * nx);
+      x = CENTER + nx * (RADIUS - 1.0);
+      y = CENTER + ny * (RADIUS - 1.0);
+    }
+
+    px[i] = x; py[i] = y; th[i] = angle;
+
+    let dep = deposit;
+    for (let k = 0; k < 3; k++) {
+      if (Math.hypot(x - foodPos[k].x, y - foodPos[k].y) < 22.0) {
+        dep = deposit * 1.8;
+      }
+    }
+
+    const ix = x | 0, iy = y | 0;
+    if (ix >= 0 && ix < RES && iy >= 0 && iy < RES) {
+      const idx = iy * RES + ix;
+      trail[idx] += dep * (1.0 + 0.15 * trail[idx]);
+    }
+  }
+
+  for (let y = 1; y < RES - 1; y++) {
+    const y0 = y * RES, ym1 = (y - 1) * RES, yp1 = (y + 1) * RES;
+    for (let x = 1; x < RES - 1; x++) {
+      const s = trail[ym1 + x - 1] + trail[ym1 + x] + trail[ym1 + x + 1] +
+                trail[y0 + x - 1]  + trail[y0 + x]  + trail[y0 + x + 1] +
+                trail[yp1 + x - 1] + trail[yp1 + x] + trail[yp1 + x + 1];
+      const blur = s / 9.0;
+      const val = (trail[y0 + x] * 0.85 + blur * 0.15) * (1.0 - decay);
+      trailNew[y0 + x] = Math.min(val, CAP);
+    }
+  }
+  trail.set(trailNew);
+
+  for (let y = 0; y < RES; y++) {
+    const row = y * RES;
+    for (let x = 0; x < RES; x++) {
+      const idx = row + x;
+      const d = Math.hypot(x - CENTER, y - CENTER);
+      if (d > RADIUS) {
+        buf32[idx] = 0xff07080a;
+        continue;
+      }
+
+      let v = Math.min(1.0, trail[idx] / CAP);
+      v = Math.pow(v, 0.6);
+
+      let r = 5, g = 7, b = 4;
+      if (v < 0.4) {
+        const t = v / 0.4;
+        r = (5 * (1 - t) + 89 * t) | 0;
+        g = (7 * (1 - t) + 107 * t) | 0;
+        b = (4 * (1 - t) + 25 * t) | 0;
+      } else {
+        const t = (v - 0.4) / 0.6;
+        r = (89 * (1 - t) + 242 * t) | 0;
+        g = (107 * (1 - t) + 224 * t) | 0;
+        b = (25 * (1 - t) + 51 * t) | 0;
+      }
+
+      for (let k = 0; k < 3; k++) {
+        if (Math.hypot(x - foodPos[k].x, y - foodPos[k].y) < 8.0) {
+          r = 180; g = 165; b = 125;
+        }
+      }
+
+      buf32[idx] = (255 << 24) | (b << 16) | (g << 8) | r;
+    }
+  }
+  ctx.putImageData(imgData, 0, 0);
+  requestAnimationFrame(step);
+}
+
+initSimulation();
+requestAnimationFrame(step);
+</script>
+</body>
+</html>
