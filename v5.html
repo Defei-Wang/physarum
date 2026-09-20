@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Physarum v5.0 - Multi-Species Antagonism & 2.5D Normal Shading</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #040507;
+      color: #94a3b8;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      overflow: hidden;
+    }
+    #stage {
+      position: relative;
+      width: 600px;
+      height: 600px;
+      background: #0d0e12;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.95);
+      border: 1px solid #1e293b;
+    }
+    canvas { width: 100%; height: 100%; display: block; cursor: crosshair; }
+    .hud-panel {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      background: rgba(15, 23, 42, 0.88);
+      border: 1px solid #334155;
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-size: 11px;
+      line-height: 1.6;
+      backdrop-filter: blur(4px);
+      user-select: none;
+    }
+    .hud-panel b { color: #f8fafc; font-size: 12px; }
+    .btn {
+      margin-top: 6px;
+      background: #475569;
+      color: #fff;
+      border: none;
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .btn:hover { background: #334155; }
+  </style>
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="cv" width="600" height="600"></canvas>
+  <div class="hud-panel">
+    <b>Physarum v5.0 (fogleman 2.5D Antagonism)</b><br>
+    相场机制: 双物种张量拮抗 (同类 +1.0, 异类 -0.4)<br>
+    着色器: 级联滤波 + 2.5D 法线高度场 (电子显微镜质感)<br>
+    操作: [鼠标左键拖拽] 注入局域高能异源扰动<br>
+    <button class="btn" onclick="initSimulation()">重置显微相场 (R)</button>
+  </div>
+</div>
+
+<script>
+const RES = 600;
+const N_AGENTS = 55000;
+
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const imgData = ctx.createImageData(RES, RES);
+const buf32 = new Uint32Array(imgData.data.buffer);
+
+const grid0 = new Float32Array(RES * RES);
+const grid1 = new Float32Array(RES * RES);
+const grid0New = new Float32Array(RES * RES);
+const grid1New = new Float32Array(RES * RES);
+
+const posX = new Float32Array(N_AGENTS);
+const posY = new Float32Array(N_AGENTS);
+const heading = new Float32Array(N_AGENTS);
+const species = new Uint8Array(N_AGENTS);
+
+const SENSOR_DIST = 12.0;
+const SENSOR_ANGLE = Math.PI / 7.0;
+const TURN_ANGLE = Math.PI / 5.0;
+const STEP_SIZE = 1.2;
+const DEPOSIT_AMT = 0.5;
+const DECAY_FACTOR = 0.93;
+const BLUR_PASSES = 2;
+
+function initSimulation() {
+  grid0.fill(0);
+  grid1.fill(0);
+  grid0New.fill(0);
+  grid1New.fill(0);
+
+  for (let i = 0; i < N_AGENTS; i++) {
+    posX[i] = Math.random() * RES;
+    posY[i] = Math.random() * RES;
+    heading[i] = Math.random() * Math.PI * 2.0;
+    species[i] = Math.random() < 0.5 ? 0 : 1;
+  }
+}
+
+function sampleFieldBilinear(x, y, sp) {
+  const nx = (x % RES + RES) % RES;
+  const ny = (y % RES + RES) % RES;
+
+  const x0 = nx | 0;
+  const y0 = ny | 0;
+  const x1 = (x0 + 1) % RES;
+  const y1 = (y0 + 1) % RES;
+
+  const fx = nx - x0;
+  const fy = ny - y0;
+
+  const w0 = (sp === 0) ? 1.0 : -0.4;
+  const w1 = (sp === 0) ? -0.4 : 1.0;
+
+  const idx00 = y0 * RES + x0;
+  const idx10 = y0 * RES + x1;
+  const idx01 = y1 * RES + x0;
+  const idx11 = y1 * RES + x1;
+
+  const v00 = grid0[idx00] * w0 + grid1[idx00] * w1;
+  const v10 = grid0[idx10] * w0 + grid1[idx10] * w1;
+  const v01 = grid0[idx01] * w0 + grid1[idx01] * w1;
+  const v11 = grid0[idx11] * w0 + grid1[idx11] * w1;
+
+  return v00 * (1.0 - fx) * (1.0 - fy) +
+         v10 * fx * (1.0 - fy) +
+         v01 * (1.0 - fx) * fy +
+         v11 * fx * fy;
+}
+
+let isMouseDown = false;
+let mousePos = { x: 0, y: 0 };
+
+function interactMouse(mx, my) {
+  for (let i = 0; i < N_AGENTS; i++) {
+    const dx = posX[i] - mx;
+    const dy = posY[i] - my;
+    if (dx * dx + dy * dy < 900.0) {
+      heading[i] += Math.PI;
+      const idx = ((posY[i] | 0) * RES + (posX[i] | 0));
+      if (species[i] === 0) grid0[idx] += 20.0;
+      else grid1[idx] += 20.0;
+    }
+  }
+}
+
+function diffuseAndDecayPass(isFinalPass) {
+  for (let y = 0; y < RES; y++) {
+    const y0 = y * RES;
+    const ym1 = ((y - 1 + RES) % RES) * RES;
+    const yp1 = ((y + 1) % RES) * RES;
+
+    for (let x = 0; x < RES; x++) {
+      const xm1 = (x - 1 + RES) % RES;
+      const xp1 = (x + 1) % RES;
+
+      const s0 = grid0[ym1 + xm1] + grid0[ym1 + x] + grid0[ym1 + xp1] +
+                 grid0[y0 + xm1]  + grid0[y0 + x]  + grid0[y0 + xp1] +
+                 grid0[yp1 + xm1] + grid0[yp1 + x] + grid0[yp1 + xp1];
+
+      const s1 = grid1[ym1 + xm1] + grid1[ym1 + x] + grid1[ym1 + xp1] +
+                 grid1[y0 + xm1]  + grid1[y0 + x]  + grid1[y0 + xp1] +
+                 grid1[yp1 + xm1] + grid1[yp1 + x] + grid1[yp1 + xp1];
+
+      let v0 = s0 / 9.0;
+      let v1 = s1 / 9.0;
+
+      if (isFinalPass) {
+        v0 *= DECAY_FACTOR;
+        v1 *= DECAY_FACTOR;
+      }
+
+      grid0New[y0 + x] = v0;
+      grid1New[y0 + x] = v1;
+    }
+  }
+  grid0.set(grid0New);
+  grid1.set(grid1New);
+}
+
+function render25DNormal() {
+  const bumpScale = 0.15;
+  const lx = 0.577, ly = 0.577, lz = 0.577;
+
+  for (let y = 0; y < RES; y++) {
+    const y0 = y * RES;
+    const ym1 = ((y - 1 + RES) % RES) * RES;
+    const yp1 = ((y + 1) % RES) * RES;
+
+    for (let x = 0; x < RES; x++) {
+      const idx = y0 + x;
+      const xm1 = (x - 1 + RES) % RES;
+      const xp1 = (x + 1) % RES;
+
+      const h_c = grid0[idx] + grid1[idx];
+      const h_l = grid0[y0 + xm1] + grid1[y0 + xm1];
+      const h_r = grid0[y0 + xp1] + grid1[y0 + xp1];
+      const h_d = grid0[ym1 + x] + grid1[ym1 + x];
+      const h_u = grid0[yp1 + x] + grid1[yp1 + x];
+
+      const dx = h_r - h_l;
+      const dy = h_u - h_d;
+
+      const nx = -dx * bumpScale;
+      const ny = -dy * bumpScale;
+      const nz = 1.0;
+      const invLen = 1.0 / Math.hypot(nx, ny, nz);
+      const ndotl = Math.max(0.0, (nx * lx + ny * ly + nz * lz) * invLen);
+
+      const mask = Math.min(1.0, h_c * 0.1);
+
+      const baseR = 0.05 * (1.0 - mask) + 0.85 * mask;
+      const baseG = 0.05 * (1.0 - mask) + 0.88 * mask;
+      const baseB = 0.06 * (1.0 - mask) + 0.90 * mask;
+
+      const shade = 0.15 + ndotl * 0.9;
+      const r = Math.min(255, (baseR * shade * 255) | 0);
+      const g = Math.min(255, (baseG * shade * 255) | 0);
+      const b = Math.min(255, (baseB * shade * 255) | 0);
+
+      buf32[idx] = (255 << 24) | (b << 16) | (g << 8) | r;
+    }
+  }
+  ctx.putImageData(imgData, 0, 0);
+}
+
+function step() {
+  if (isMouseDown) {
+    interactMouse(mousePos.x, mousePos.y);
+  }
+
+  for (let i = 0; i < N_AGENTS; i++) {
+    let pX = posX[i];
+    let pY = posY[i];
+    let ang = heading[i];
+    const sp = species[i];
+
+    const dirF_x = Math.cos(ang), dirF_y = Math.sin(ang);
+    const dirL_x = Math.cos(ang - SENSOR_ANGLE), dirL_y = Math.sin(ang - SENSOR_ANGLE);
+    const dirR_x = Math.cos(ang + SENSOR_ANGLE), dirR_y = Math.sin(ang + SENSOR_ANGLE);
+
+    const vF = sampleFieldBilinear(pX + dirF_x * SENSOR_DIST, pY + dirF_y * SENSOR_DIST, sp);
+    const vL = sampleFieldBilinear(pX + dirL_x * SENSOR_DIST, pY + dirL_y * SENSOR_DIST, sp);
+    const vR = sampleFieldBilinear(pX + dirR_x * SENSOR_DIST, pY + dirR_y * SENSOR_DIST, sp);
+
+    if (vF > vL && vF > vR) {
+    } else if (vF < vL && vF < vR) {
+      ang += (Math.random() < 0.5) ? TURN_ANGLE : -TURN_ANGLE;
+    } else if (vL > vR) {
+      ang -= TURN_ANGLE;
+    } else if (vR > vL) {
+      ang += TURN_ANGLE;
+    }
+
+    pX = (pX + Math.cos(ang) * STEP_SIZE + RES) % RES;
+    pY = (pY + Math.sin(ang) * STEP_SIZE + RES) % RES;
+
+    posX[i] = pX;
+    posY[i] = pY;
+    heading[i] = ang;
+
+    const ix = pX | 0;
+    const iy = pY | 0;
+    const idx = iy * RES + ix;
+    if (sp === 0) grid0[idx] += DEPOSIT_AMT;
+    else grid1[idx] += DEPOSIT_AMT;
+  }
+
+  for (let p = 0; p < BLUR_PASSES; p++) {
+    diffuseAndDecayPass(p === BLUR_PASSES - 1);
+  }
+
+  render25DNormal();
+
+  requestAnimationFrame(step);
+}
+
+cv.addEventListener('mousedown', (e) => {
+  isMouseDown = true;
+  const rect = cv.getBoundingClientRect();
+  mousePos.x = (e.clientX - rect.left) * (RES / rect.width);
+  mousePos.y = (e.clientY - rect.top) * (RES / rect.height);
+});
+
+window.addEventListener('mousemove', (e) => {
+  if (isMouseDown) {
+    const rect = cv.getBoundingClientRect();
+    mousePos.x = (e.clientX - rect.left) * (RES / rect.width);
+    mousePos.y = (e.clientY - rect.top) * (RES / rect.height);
+  }
+});
+
+window.addEventListener('mouseup', () => { isMouseDown = false; });
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'r' || e.key === 'R') initSimulation();
+});
+
+initSimulation();
+requestAnimationFrame(step);
+</script>
+</body>
+</html>
