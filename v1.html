@@ -1,219 +1,213 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <title>Physarum v1.0 - Baseline Dense Swarm</title>
+  <title>Physarum v1.0 - Baseline Dense Swarm & Shuttle Streaming</title>
   <style>
-    body { margin: 0; background: #000; overflow: hidden; display: flex; justify-content: center; align-items: center; height: 100vh; }
-    canvas { width: 100vmin; height: 100vmin; display: block; }
-    .hud { position: absolute; top: 12px; left: 12px; color: #aaa; font-family: monospace; font-size: 12px; pointer-events: none; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #050608;
+      color: #94a3b8;
+      font-family: monospace;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      overflow: hidden;
+    }
+    #canvas-container {
+      position: relative;
+      width: 700px;
+      height: 700px;
+      box-shadow: 0 0 40px rgba(0,0,0,0.9);
+      border-radius: 50%;
+      border: 2px solid #1e293b;
+      overflow: hidden;
+    }
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: crosshair;
+    }
+    .hud {
+      position: absolute;
+      top: 16px;
+      left: 20px;
+      pointer-events: none;
+      font-size: 12px;
+      line-height: 1.6;
+      background: rgba(15, 23, 42, 0.75);
+      padding: 8px 12px;
+      border-radius: 6px;
+      border: 1px solid rgba(51, 65, 85, 0.5);
+    }
+    .hud b { color: #38bdf8; }
   </style>
 </head>
 <body>
-  <div class="hud">v1.0: Baseline Dense Swarm (1.2M Particles + Shuttle Streaming)<br>Click to deposit oat nutrient</div>
-  <canvas id="c"></canvas>
 
-  <script>
-    const canvas = document.getElementById("c");
-    const gl = canvas.getContext("webgl");
-    const RES = 800; // 适配 WebGL 视口
-    const N_AGENTS = 250000; // 浏览器 GPGPU 极限帧率平衡
-    canvas.width = RES; canvas.height = RES;
-    gl.getExtension("OES_texture_float");
+<div id="canvas-container">
+  <canvas id="simCanvas" width="600" height="600"></canvas>
+  <div class="hud">
+    <b>Physarum Engine v1.0</b><br>
+    Model: Jones (2010) + Shuttle Streaming<br>
+    Agents: 50,000 | SO: 22.5° | SA: 45°<br>
+    Decay: 0.94 | Traveling Wave Modulated<br>
+    [R]: 重置基底质点池
+  </div>
+</div>
 
-    // 编译着色器
-    function createShader(gl, type, src) {
-      const s = gl.createShader(type);
-      gl.shaderSource(s, src);
-      gl.compileShader(s);
-      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(s);
-      return s;
-    }
-    function createProgram(gl, vs, fs) {
-      const p = gl.createProgram();
-      gl.attachShader(p, createShader(gl, gl.VERTEX_SHADER, vs));
-      gl.attachShader(p, createShader(gl, gl.FRAGMENT_SHADER, fs));
-      gl.linkProgram(p);
-      return p;
-    }
+<script>
+const RES = 600;
+const N_AGENTS = 50000;
+const CENTER_X = RES / 2.0;
+const CENTER_Y = RES / 2.0;
+const RADIUS = RES / 2.0 - 4.0;
 
-    const baseVS = `attribute vec2 p; void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
+const canvas = document.getElementById('simCanvas');
+const ctx = canvas.getContext('2d');
+const imgData = ctx.createImageData(RES, RES);
+const buf32 = new Uint32Array(imgData.data.buffer);
 
-    // 1. 物理扩散与降解卷积
-    const diffuseFS = `
-      precision highp float;
-      uniform sampler2D u_trail;
-      uniform vec2 u_res;
-      void main() {
-        vec2 uv = gl_FragCoord.xy / u_res;
-        vec2 d = 1.0 / u_res;
-        float c = texture2D(u_trail, uv).r;
-        float blur = (
-          texture2D(u_trail, uv + vec2(-d.x, 0.0)).r +
-          texture2D(u_trail, uv + vec2(d.x, 0.0)).r +
-          texture2D(u_trail, uv + vec2(0.0, -d.y)).r +
-          texture2D(u_trail, uv + vec2(0.0, d.y)).r
-        ) * 0.25;
-        float res = mix(c, blur, 0.15) * 0.94; // 对应 Python 的 DIFFUSE_RATE=0.15, DECAY=0.94
-        gl_FragColor = vec4(res, 0.0, 0.0, 1.0);
-      }
-    `;
+let trail = new Float32Array(RES * RES);
+let trailNew = new Float32Array(RES * RES);
 
-    // 2. 双尺度非线性吸收着色器
-    const renderFS = `
-      precision highp float;
-      uniform sampler2D u_trail;
-      uniform vec2 u_res;
-      void main() {
-        float val = texture2D(u_trail, gl_FragCoord.xy / u_res).r;
-        vec3 bg = vec3(0.05, 0.06, 0.055);
-        if (val < 0.08) {
-          gl_FragColor = vec4(bg, 1.0);
-        } else {
-          float fringe = min(1.0, val * 0.08);
-          float core = pow(min(1.0, val * 0.03), 3.0);
-          float r = bg.r + fringe * 0.65 + core * 0.35;
-          float g = bg.g + fringe * 0.75 + core * 0.25;
-          float b = bg.b + fringe * 0.45 - core * 0.25;
-          gl_FragColor = vec4(r, g, max(0.0, b), 1.0);
-        }
-      }
-    `;
+const posX = new Float32Array(N_AGENTS);
+const posY = new Float32Array(N_AGENTS);
+const heading = new Float32Array(N_AGENTS);
 
-    const progDiffuse = createProgram(gl, baseVS, diffuseFS);
-    const progRender = createProgram(gl, baseVS, renderFS);
+function initSim() {
+  trail.fill(0);
+  trailNew.fill(0);
+  for (let i = 0; i < N_AGENTS; i++) {
+    const ang = Math.random() * Math.PI * 2.0;
+    const r = Math.sqrt(Math.random()) * (RADIUS - 20.0);
+    posX[i] = CENTER_X + Math.cos(ang) * r;
+    posY[i] = CENTER_Y + Math.sin(ang) * r;
+    heading[i] = ang + Math.PI * 0.5;
+  }
+}
 
-    // 帧缓冲创建
-    function makeFBO() {
-      const tex = gl.createTexture();
-      gl.bindTexture(gl.TEXTURE_2D, tex);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, RES, RES, 0, gl.RGBA, gl.FLOAT, null);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      const fbo = gl.createFramebuffer();
-      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-      return { fbo, tex };
-    }
-    let fboA = makeFBO(), fboB = makeFBO();
+function sampleField(x, y) {
+  const ix = (x + RES) % RES | 0;
+  const iy = (y + RES) % RES | 0;
+  return trail[iy * RES + ix];
+}
 
-    // CPU 端维持质点三向嗅探与穿梭流行波
-    const agents = new Float32Array(N_AGENTS * 3);
-    const SO = 22.5 * Math.PI / 180.0, SA = 45.0 * Math.PI / 180.0, SS = 3.5;
-    for (let i = 0; i < N_AGENTS; i++) {
-      let bx = RES * 0.5, by = RES * 0.5;
-      const cl = Math.random();
-      if (cl < 0.33) { bx -= 120; by -= 40; }
-      else if (cl < 0.66) { bx += 120; by += 40; }
-      const r = Math.sqrt(Math.random()) * 45.0;
-      const th = Math.random() * Math.PI * 2.0;
-      agents[i*3] = bx + Math.cos(th) * r;
-      agents[i*3+1] = by + Math.sin(th) * r;
-      agents[i*3+2] = th + (Math.random() - 0.5) * 0.8;
+const SO = 9.0;
+const SA = 0.3927; // 22.5 度
+const RA = 0.7854; // 45.0 度
+const BASE_SPEED = 2.0;
+let stepCount = 0;
+
+function stepSimulation() {
+  stepCount++;
+  const omega = 0.04;
+  const kx = 0.015;
+  const ky = 0.015;
+
+  for (let i = 0; i < N_AGENTS; i++) {
+    let pX = posX[i];
+    let pY = posY[i];
+    let h = heading[i];
+
+    // 穿梭流行波调制步长与沉积
+    const wave = Math.sin(omega * stepCount - (kx * pX + ky * pY));
+    const speed = BASE_SPEED * (1.0 + 0.35 * wave);
+    const deposit = 5.0 * (1.0 + 0.5 * wave);
+
+    const fX = pX + Math.cos(h) * SO;
+    const fY = pY + Math.sin(h) * SO;
+    const lX = pX + Math.cos(h + SA) * SO;
+    const lY = pY + Math.sin(h + SA) * SO;
+    const rX = pX + Math.cos(h - SA) * SO;
+    const rY = pY + Math.sin(h - SA) * SO;
+
+    const Fv = sampleField(fX, fY);
+    const Lv = sampleField(lX, lY);
+    const Rv = sampleField(rX, rY);
+
+    if (Fv > Lv && Fv > Rv) {
+      // 保持原方向
+    } else if (Fv < Lv && Fv < Rv) {
+      h += (Math.random() < 0.5) ? RA : -RA;
+    } else if (Lv < Rv) {
+      h -= RA;
+    } else if (Rv < Lv) {
+      h += RA;
     }
 
-    // 质点沉积点着色器
-    const agentVS = `
-      attribute vec2 a_pos;
-      uniform vec2 u_res;
-      void main() {
-        vec2 norm = (a_pos / u_res) * 2.0 - 1.0;
-        gl_Position = vec4(norm, 0.0, 1.0);
-        gl_PointSize = 1.0;
-      }
-    `;
-    const agentFS = `precision highp float; uniform float u_dep; void main() { gl_FragColor = vec4(u_dep, 0.0, 0.0, 1.0); }`;
-    const progAgent = createProgram(gl, agentVS, agentFS);
+    h += (Math.random() - 0.5) * 0.15;
+    pX += Math.cos(h) * speed;
+    pY += Math.sin(h) * speed;
 
-    const quadBuf = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
-
-    const agentBuf = gl.createBuffer();
-    let timeStep = 0.0;
-    const trailData = new Float32Array(RES * RES * 4);
-
-    // 模拟迭代
-    function loop() {
-      timeStep += 0.04;
-      const streamDir = Math.sin(timeStep * 0.15) > 0.0 ? 1.0 : -1.0;
-
-      // 提取 GPU 轨迹场回读给 CPU 嗅探
-      gl.bindFramebuffer(gl.FRAMEBUFFER, fboA.fbo);
-      gl.readPixels(0, 0, RES, RES, gl.RGBA, gl.FLOAT, trailData);
-
-      for (let i = 0; i < N_AGENTS; i++) {
-        let x = agents[i*3], y = agents[i*3+1], ang = agents[i*3+2];
-        const sense = (angle) => {
-          const sx = Math.floor(x + Math.cos(angle) * SS);
-          const sy = Math.floor(y + Math.sin(angle) * SS);
-          if (sx > 0 && sx < RES - 1 && sy > 0 && sy < RES - 1) return trailData[(sy * RES + sx) * 4];
-          return 0.0;
-        };
-        const f = sense(ang), l = sense(ang - SO), r = sense(ang + SO);
-        if (f > l && f > r) {}
-        else if (f < l && f < r) ang += Math.random() < 0.5 ? SA : -SA;
-        else if (l > r) ang -= SA;
-        else if (r > l) ang += SA;
-
-        ang += (Math.random() - 0.5) * 0.15;
-        const pulse = Math.sin(timeStep * 2.0 - (x + y) * 0.015 * streamDir);
-        const speed = 1.0;
-        x += Math.cos(ang) * speed;
-        y += Math.sin(ang) * speed;
-
-        if (x < 2 || x >= RES - 2 || y < 2 || y >= RES - 2) {
-          x = Math.max(2, Math.min(RES - 2.1, x));
-          y = Math.max(2, Math.min(RES - 2.1, y));
-          ang = Math.random() * Math.PI * 2.0;
-        }
-        agents[i*3] = x; agents[i*3+1] = y; agents[i*3+2] = ang;
-      }
-
-      // 1. 粒子物理沉积到 fboA
-      gl.bindFramebuffer(gl.FRAMEBUFFER, fboA.fbo);
-      gl.useProgram(progAgent);
-      gl.enable(gl.BLEND);
-      gl.blendFunc(gl.ONE, gl.ONE);
-      gl.bindBuffer(gl.ARRAY_BUFFER, agentBuf);
-      gl.bufferData(gl.ARRAY_BUFFER, agents, gl.DYNAMIC_DRAW);
-      const aLoc = gl.getAttribLocation(progAgent, "a_pos");
-      gl.enableVertexAttribArray(aLoc);
-      gl.vertexAttribPointer(aLoc, 2, gl.FLOAT, false, 12, 0);
-      gl.uniform2f(gl.getUniformLocation(progAgent, "u_res"), RES, RES);
-      gl.uniform1f(gl.getUniformLocation(progAgent, "u_dep"), 4.0);
-      gl.drawArrays(gl.POINTS, 0, N_AGENTS);
-      gl.disable(gl.BLEND);
-
-      // 2. 卷积扩散 (fboA -> fboB)
-      gl.bindFramebuffer(gl.FRAMEBUFFER, fboB.fbo);
-      gl.useProgram(progDiffuse);
-      gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
-      const pLoc = gl.getAttribLocation(progDiffuse, "p");
-      gl.enableVertexAttribArray(pLoc);
-      gl.vertexAttribPointer(pLoc, 2, gl.FLOAT, false, 0, 0);
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, fboA.tex);
-      gl.uniform1i(gl.getUniformLocation(progDiffuse, "u_trail"), 0);
-      gl.uniform2f(gl.getUniformLocation(progDiffuse, "u_res"), RES, RES);
-      gl.drawArrays(gl.TRIANGLES, 0, 6);
-
-      // Ping-Pong 交换
-      let tmp = fboA; fboA = fboB; fboB = tmp;
-
-      // 3. 最终渲染到屏幕
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      gl.useProgram(progRender);
-      gl.bindTexture(gl.TEXTURE_2D, fboA.tex);
-      gl.uniform1i(gl.getUniformLocation(progRender, "u_trail"), 0);
-      gl.uniform2f(gl.getUniformLocation(progRender, "u_res"), RES, RES);
-      gl.drawArrays(gl.TRIANGLES, 0, 6);
-
-      requestAnimationFrame(loop);
+    // 圆形刚性边界环形回绕/反弹
+    const relX = pX - CENTER_X;
+    const relY = pY - CENTER_Y;
+    const dist = Math.hypot(relX, relY);
+    if (dist > RADIUS) {
+      const nx = relX / dist;
+      const ny = relY / dist;
+      const dot = Math.cos(h) * nx + Math.sin(h) * ny;
+      h = Math.atan2(Math.sin(h) - 2.0 * dot * ny, Math.cos(h) - 2.0 * dot * nx);
+      pX = CENTER_X + nx * (RADIUS - 2.0);
+      pY = CENTER_Y + ny * (RADIUS - 2.0);
     }
-    loop();
-  </script>
+
+    posX[i] = pX;
+    posY[i] = pY;
+    heading[i] = h;
+
+    const ix = pX | 0;
+    const iy = pY | 0;
+    if (ix >= 0 && ix < RES && iy >= 0 && iy < RES) {
+      trail[iy * RES + ix] += deposit;
+    }
+  }
+
+  // 3x3 空间滤波与 0.94 衰减
+  const decayFactor = 0.94;
+  for (let y = 0; y < RES; y++) {
+    const ym1 = (y > 0 ? y - 1 : 0) * RES;
+    const y0 = y * RES;
+    const yp1 = (y < RES - 1 ? y + 1 : RES - 1) * RES;
+
+    for (let x = 0; x < RES; x++) {
+      const xm1 = x > 0 ? x - 1 : 0;
+      const xp1 = x < RES - 1 ? x + 1 : RES - 1;
+
+      const s = trail[ym1 + xm1] + trail[ym1 + x] + trail[ym1 + xp1] +
+                trail[y0 + xm1]  + trail[y0 + x]  + trail[y0 + xp1] +
+                trail[yp1 + xm1] + trail[yp1 + x] + trail[yp1 + xp1];
+
+      trailNew[y0 + x] = (s / 9.0) * decayFactor;
+    }
+  }
+  trail.set(trailNew);
+
+  // 渲染荧光黄绿调色板
+  for (let i = 0; i < RES * RES; i++) {
+    const val = Math.min(255, trail[i] * 1.5) | 0;
+    if (val === 0) {
+      buf32[i] = 0xff080605;
+    } else {
+      const r = (val * 0.45) | 0;
+      const g = (val * 0.95) | 0;
+      const b = (val * 0.25) | 0;
+      buf32[i] = (255 << 24) | (b << 16) | (g << 8) | r;
+    }
+  }
+  ctx.putImageData(imgData, 0, 0);
+  requestAnimationFrame(stepSimulation);
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'r' || e.key === 'R') initSim();
+});
+
+initSim();
+requestAnimationFrame(stepSimulation);
+</script>
 </body>
 </html>
