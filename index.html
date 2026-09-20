@@ -56,9 +56,10 @@
       color: #f1f5f9;
     }
     .tag-btn.active {
-      background: #3b82f6;
-      color: #ffffff;
-      border-color: #60a5fa;
+      background: #eab308;
+      color: #0f172a;
+      border-color: #facc15;
+      font-weight: 600;
     }
     #viewport {
       flex: 1;
@@ -81,13 +82,18 @@
       <span id="api-status" class="status">Loading tags...</span>
     </div>
     <div class="nav-tags" id="tag-container">
-      <!-- 默认静态保底按钮 -->
-      <button class="tag-btn active" onclick="loadVersion('v1.html', this)">v1.0</button>
+      <!-- 完整版本保底按钮：默认高亮 v6.0 -->
+      <button class="tag-btn" onclick="loadVersion('v1.html', this)">v1.0</button>
       <button class="tag-btn" onclick="loadVersion('v2.html', this)">v2.0</button>
+      <button class="tag-btn" onclick="loadVersion('v3.html', this)">v3.0</button>
+      <button class="tag-btn" onclick="loadVersion('v4.html', this)">v4.0</button>
+      <button class="tag-btn" onclick="loadVersion('v5.html', this)">v5.0</button>
+      <button class="tag-btn active" onclick="loadVersion('v6.html', this)">v6.0</button>
     </div>
   </header>
 
-  <iframe id="viewport" src="v1.html"></iframe>
+  <!-- 默认加载最新一代 v6.html -->
+  <iframe id="viewport" src="v6.html"></iframe>
 
   <script>
     const GITHUB_REPO = "Defei-Wang/physarum";
@@ -109,27 +115,27 @@
         
         if (tags && tags.length > 0) {
           container.innerHTML = "";
-          // 按照版本自然排序 (如 v1.0, v2.0 ...)
+          // 按版本自然排序升序 (v1.0 -> v6.0)
           const sortedTags = tags.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
 
           sortedTags.forEach((tag, idx) => {
             const btn = document.createElement('button');
-            btn.className = `tag-btn ${idx === 0 ? 'active' : ''}`;
+            const isLatest = idx === sortedTags.length - 1;
+            btn.className = `tag-btn ${isLatest ? 'active' : ''}`;
             btn.innerText = tag.name;
             
-            // 约定：每个 tag 对应根目录下的同名主版本 html，如 v1.0 -> v1.html
             const majorMatch = tag.name.match(/v(\d+)/i);
             const targetHtml = majorMatch ? `v${majorMatch[1]}.html` : `${tag.name}.html`;
             
             btn.onclick = () => loadVersion(targetHtml, btn);
             container.appendChild(btn);
 
-            if (idx === 0) loadVersion(targetHtml, btn);
+            if (isLatest) loadVersion(targetHtml, btn);
           });
-          statusEl.innerText = `Synchronized: ${tags.length} tags`;
+          statusEl.innerText = `Synchronized: ${tags.length} tags (Latest: ${sortedTags[sortedTags.length - 1].name})`;
         }
       } catch (err) {
-        statusEl.innerText = `API Rate Limited / Offline (Serving default)`;
+        statusEl.innerText = `API Cached / Offline (Serving default)`;
       }
     }
 
