@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Physarum v4.0 - Dual-Channel Delayed Blending & Torus Topology</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #050505;
+      color: #94a3b8;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      overflow: hidden;
+    }
+    #stage {
+      position: relative;
+      width: 600px;
+      height: 600px;
+      background: #000;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.95);
+      border: 1px solid #1e293b;
+    }
+    canvas { width: 100%; height: 100%; display: block; cursor: crosshair; }
+    .hud-panel {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      background: rgba(15, 23, 42, 0.88);
+      border: 1px solid #334155;
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-size: 11px;
+      line-height: 1.6;
+      backdrop-filter: blur(4px);
+      user-select: none;
+    }
+    .hud-panel b { color: #38bdf8; font-size: 12px; }
+    .btn {
+      margin-top: 6px;
+      background: #0284c7;
+      color: #fff;
+      border: none;
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .btn:hover { background: #0369a1; }
+  </style>
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="cv" width="600" height="600"></canvas>
+  <div class="hud-panel">
+    <b>Physarum v4.0 (nicoptere WebGL 1:1)</b><br>
+    流水线: 双通道解耦 (R 冲量 + G 记忆相场)<br>
+    拓扑: Torus 无缝周期回绕 | 渲染: 灰度后处理<br>
+    操作: [鼠标拖拽] 在指针周围播撒扰动粒子流<br>
+    <button class="btn" onclick="initSimulation()">重置相场 (R)</button>
+  </div>
+</div>
+
+<script>
+const RES = 600;
+const N_AGENTS = 55000;
+
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const imgData = ctx.createImageData(RES, RES);
+const buf32 = new Uint32Array(imgData.data.buffer);
+
+const fieldR = new Float32Array(RES * RES);
+const fieldG = new Float32Array(RES * RES);
+const fieldGNew = new Float32Array(RES * RES);
+
+const posX = new Float32Array(N_AGENTS);
+const posY = new Float32Array(N_AGENTS);
+const angle = new Float32Array(N_AGENTS);
+
+const DECAY = 0.90;
+const SA_RAW = 2.0;
+const RA_RAW = 4.0;
+const SO_RAW = 12.0;
+const SS_RAW = 1.1;
+
+const RAD = 1.0 / Math.PI;
+const SA = SA_RAW * RAD;
+const RA = RA_RAW * RAD;
+
+function initSimulation() {
+  fieldR.fill(0);
+  fieldG.fill(0);
+  fieldGNew.fill(0);
+
+  for (let i = 0; i < N_AGENTS; i++) {
+    posX[i] = Math.random() * RES;
+    posY[i] = Math.random() * RES;
+    angle[i] = Math.random() * Math.PI * 2.0;
+  }
+}
+
+function getTrailValue(x, y) {
+  const ix = ((x % RES + RES) % RES) | 0;
+  const iy = ((y % RES + RES) % RES) | 0;
+  return fieldG[iy * RES + ix];
+}
+
+let isMouseDown = false;
+let mousePos = { x: 0, y: 0 };
+
+function interactMouse(mx, my) {
+  const count = 600;
+  const radius = 24.0;
+  for (let i = 0; i < count; i++) {
+    const idx = (Math.random() * N_AGENTS) | 0;
+    const a = Math.random() * Math.PI * 2.0;
+    const r = Math.random() * radius;
+    posX[idx] = (mx + Math.cos(a) * r + RES) % RES;
+    posY[idx] = (my + Math.sin(a) * r + RES) % RES;
+  }
+}
+
+function step() {
+  if (isMouseDown) {
+    interactMouse(mousePos.x, mousePos.y);
+  }
+
+  fieldR.fill(0);
+
+  for (let i = 0; i < N_AGENTS; i++) {
+    let pX = posX[i];
+    let pY = posY[i];
+    let ang = angle[i];
+
+    const uvFL_x = pX + Math.cos(ang - SA) * SO_RAW;
+    const uvFL_y = pY + Math.sin(ang - SA) * SO_RAW;
+    const uvF_x  = pX + Math.cos(ang) * SO_RAW;
+    const uvF_y  = pY + Math.sin(ang) * SO_RAW;
+    const uvFR_x = pX + Math.cos(ang + SA) * SO_RAW;
+    const uvFR_y = pY + Math.sin(ang + SA) * SO_RAW;
+
+    const FL = getTrailValue(uvFL_x, uvFL_y);
+    const F  = getTrailValue(uvF_x, uvF_y);
+    const FR = getTrailValue(uvFR_x, uvFR_y);
+
+    if (F > FL && F > FR) {
+    } else if (F < FL && F < FR) {
+      ang += (Math.random() > 0.5) ? RA : -RA;
+    } else if (FL < FR) {
+      ang += RA;
+    } else if (FL > FR) {
+      ang -= RA;
+    }
+
+    pX = (pX + Math.cos(ang) * SS_RAW + RES) % RES;
+    pY = (pY + Math.sin(ang) * SS_RAW + RES) % RES;
+
+    posX[i] = pX;
+    posY[i] = pY;
+    angle[i] = ang;
+
+    const ix = pX | 0;
+    const iy = pY | 0;
+    fieldR[iy * RES + ix] += 1.0;
+  }
+
+  const weight = 1.0 / 9.0;
+  for (let y = 0; y < RES; y++) {
+    const y0 = y * RES;
+    const ym1 = ((y - 1 + RES) % RES) * RES;
+    const yp1 = ((y + 1) % RES) * RES;
+
+    for (let x = 0; x < RES; x++) {
+      const xm1 = (x - 1 + RES) % RES;
+      const xp1 = (x + 1) % RES;
+
+      const rSum = fieldR[ym1 + xm1] + fieldR[ym1 + x] + fieldR[ym1 + xp1] +
+                   fieldR[y0 + xm1]  + fieldR[y0 + x]  + fieldR[y0 + xp1] +
+                   fieldR[yp1 + xm1] + fieldR[yp1 + x] + fieldR[yp1 + xp1];
+
+      const gSum = fieldG[ym1 + xm1] + fieldG[ym1 + x] + fieldG[ym1 + xp1] +
+                   fieldG[y0 + xm1]  + fieldG[y0 + x]  + fieldG[y0 + xp1] +
+                   fieldG[yp1 + xm1] + fieldG[yp1 + x] + fieldG[yp1 + xp1];
+
+      const col = rSum * weight + gSum * weight * 0.5;
+      fieldGNew[y0 + x] = col * DECAY;
+    }
+  }
+  fieldG.set(fieldGNew);
+
+  for (let i = 0; i < RES * RES; i++) {
+    const val = Math.min(255, Math.max(0, (fieldG[i] * 255) | 0));
+    buf32[i] = (255 << 24) | (val << 16) | (val << 8) | val;
+  }
+  ctx.putImageData(imgData, 0, 0);
+
+  requestAnimationFrame(step);
+}
+
+cv.addEventListener('mousedown', (e) => {
+  isMouseDown = true;
+  const rect = cv.getBoundingClientRect();
+  mousePos.x = (e.clientX - rect.left) * (RES / rect.width);
+  mousePos.y = (e.clientY - rect.top) * (RES / rect.height);
+});
+
+window.addEventListener('mousemove', (e) => {
+  if (isMouseDown) {
+    const rect = cv.getBoundingClientRect();
+    mousePos.x = (e.clientX - rect.left) * (RES / rect.width);
+    mousePos.y = (e.clientY - rect.top) * (RES / rect.height);
+  }
+});
+
+window.addEventListener('mouseup', () => { isMouseDown = false; });
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'r' || e.key === 'R') initSimulation();
+});
+
+initSimulation();
+requestAnimationFrame(step);
+</script>
+</body>
+</html>
